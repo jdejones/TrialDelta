@@ -4,7 +4,7 @@ import ssl
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from sqlalchemy import select, func
-from .db import Session, User, Follow, DigestDelivery, now
+from .db import Session, User, AccountProfile, Follow, DigestDelivery, now
 from .services import published_changes
 
 
@@ -16,14 +16,14 @@ def build_digest(db, user, day):
         "follow_count": db.scalar(
             select(func.count()).select_from(Follow).where(Follow.user_id == user.id)
         ),
-        "note": "Only reviewed changes approved on this date (UTC) enter the brief. No update does not establish that a company or trial is unchanged. Coverage is limited to captured sources.",
+        "note": "Registry changes detected on this date (UTC) and company evidence approved on this date enter the brief. No update does not establish that a company or trial is unchanged. Coverage is limited to captured sources.",
     }
 
 
 def digest_text(digest):
     lines = [
         f'TrialDelta | {digest["day"]}',
-        f'{len(digest["changes"])} reviewed changes',
+        f'{len(digest["changes"])} changes',
         "",
     ]
     origin = os.getenv("APP_ORIGIN", "http://127.0.0.1:8765")
@@ -47,7 +47,7 @@ def digest_text(digest):
 
 
 def deliver_daily(day=None):
-    """Explicit worker option only; app endpoints never send mail."""
+    """Explicit worker option only; send digests to verified, opted-in users."""
     day = day or (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
     host = os.environ.get("SMTP_HOST")
     sender = os.environ.get("SMTP_FROM")
@@ -58,6 +58,9 @@ def deliver_daily(day=None):
         users = db.scalars(select(User).where(User.digest_enabled == True)).all()
         for user in users:
             if user.email.endswith(".local"):
+                continue
+            profile = db.get(AccountProfile, user.id)
+            if not profile or not profile.email_verified_at:
                 continue
             if db.scalar(
                 select(DigestDelivery).where(
@@ -77,7 +80,7 @@ def deliver_daily(day=None):
             msg["From"] = sender
             msg["To"] = user.email
             msg["Subject"] = (
-                f'TrialDelta | {len(digest["changes"])} reviewed changes | {day}'
+                f'TrialDelta | {len(digest["changes"])} changes | {day}'
             )
             msg.set_content(digest_text(digest))
             sending = False

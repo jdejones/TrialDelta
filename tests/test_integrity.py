@@ -50,6 +50,8 @@ def test_field_diffs_and_immutable_source(db, raw):
     rows = db.scalars(select(Change)).all()
     assert {r.category for r in rows} == {"enrollment", "registry_date"}
     assert all(r.before_snapshot and r.after_snapshot and not r.reviewed for r in rows)
+    assert all(r.review_status == "automatic" and r.reviewed_at is None for r in rows)
+    assert {row["id"] for row in published_changes(db, 1)} == {r.id for r in rows}
     first = db.scalar(select(Snapshot).order_by(Snapshot.id))
     assert (
         json.loads(first.raw_json)["protocolSection"]["designModule"]["enrollmentInfo"][

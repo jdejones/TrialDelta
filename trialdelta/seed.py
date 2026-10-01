@@ -1,7 +1,8 @@
 from sqlalchemy import select
 from .db import Company, User, Follow, Session
 
-# Directory entries, not assertions that any particular program remains active.
+# Initial directory entries, not a therapeutic-area allowlist or assertions that
+# any particular program remains active. New entries use the neutral area default.
 COMPANIES = [
     ("ARVN", "Arvinas", "Arvinas", "https://www.arvinas.com"),
     ("BEAM", "Beam Therapeutics", "Beam Therapeutics", "https://beamtx.com"),

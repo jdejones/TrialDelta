@@ -7,10 +7,19 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 import httpx
-from sqlalchemy import select, text, update
+from sqlalchemy import select, text
 from .db import Session, engine, Company, Study, Snapshot, Change, Job, now
+from .company_names import sponsor_key
 
 API = "https://clinicaltrials.gov/api/v2/studies"
+COVERAGE_REFRESH_WARNING = (
+    "Company coverage refresh failed. Continuing with the previously active coverage; "
+    "check the market database and company-name dataset before the next run."
+)
+INACTIVE_SELECTION_WARNING = (
+    "Selected companies tagged Delisted or Outside Healthcare were skipped. "
+    "Their saved trial history is retained."
+)
 FIELDS = {
     "status": ("development_status", "Recruitment status changed"),
     "enrollment": ("enrollment", "Enrollment changed"),
@@ -25,16 +34,6 @@ FIELDS = {
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-
-
-def sponsor_key(name):
-    return " ".join(
-        re.sub(
-            r"\b(incorporated|inc|corporation|corp|ltd|limited|llc|gmbh|ag|se)\b",
-            "",
-            re.sub(r"[^a-z0-9 ]", " ", name.lower()),
-        ).split()
-    )
 
 
 def normalize(raw):
@@ -55,12 +54,13 @@ def normalize(raw):
         "sponsor": p.get("sponsorCollaboratorsModule", {})
         .get("leadSponsor", {})
         .get("name", ""),
+        # Keep the compatibility field name while indexing all interventions.
         "drug": "; ".join(
             sorted(
                 {
                     i["name"]
                     for i in interventions
-                    if i.get("type") in ("DRUG", "BIOLOGICAL", "GENETIC")
+                    if i.get("name")
                 }
             )
         ),
@@ -141,6 +141,8 @@ def ingest(db, company, raw):
                         before_value=display(previous.get(key)),
                         after_value=display(n.get(key)),
                         source="registry",
+                        review_status="automatic",
+                        reviewed=False,
                         before_snapshot=old.id,
                         after_snapshot=snapshot.id,
                     )
@@ -150,16 +152,16 @@ def ingest(db, company, raw):
 
 
 def fetch_company(company):
+    """Collect every study type and condition for the exact lead sponsor."""
     params = {
         "query.spons": company.sponsor,
-        "query.cond": "cancer OR neoplasm OR tumor OR leukemia OR lymphoma OR myeloma",
-        "query.term": "AREA[StudyType]INTERVENTIONAL",
         "format": "json",
         "pageSize": 100,
     }
     studies = []
+    seen_tokens = set()
     with httpx.Client(timeout=45) as client:
-        for _ in range(30):
+        while True:
             for attempt in range(3):
                 response = client.get(API, params=params)
                 if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
@@ -168,18 +170,22 @@ def fetch_company(company):
                 response.raise_for_status()
                 break
             payload = response.json()
-            if not isinstance(payload.get("studies", []), list):
+            if not isinstance(payload, dict) or not isinstance(payload.get("studies"), list):
                 raise ValueError("Malformed registry response")
-            for raw in payload.get("studies", []):
+            token = payload.get("nextPageToken")
+            if token is not None and (not isinstance(token, str) or not token):
+                raise ValueError("Invalid registry page cursor; no partial update applied")
+            if token in seen_tokens:
+                raise ValueError("Repeated registry page cursor; no partial update applied")
+            for raw in payload["studies"]:
                 n = normalize(raw)
                 if sponsor_key(n["sponsor"]) == sponsor_key(company.sponsor):
                     studies.append(raw)
-            token = payload.get("nextPageToken")
             if not token:
                 return studies
+            seen_tokens.add(token)
             params["pageToken"] = token
             time.sleep(0.25)
-    raise ValueError("Pagination safety limit reached; no partial update applied")
 
 
 @contextmanager
@@ -226,41 +232,68 @@ def sync_lock():
                     fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def sync_all(company_id=None):
+def interrupt_running_jobs(db, except_job_id=None):
+    """Only call while holding sync_lock; preserve bulk checkpoints and totals."""
+    for previous in db.scalars(select(Job).where(Job.status == "running")):
+        if previous.id == except_job_id:
+            continue
+        previous.status, previous.finished_at = "interrupted", now()
+        try:
+            summary = json.loads(previous.summary or "{}")
+        except (TypeError, ValueError):
+            summary = {}
+        if not isinstance(summary, dict):
+            summary = {}
+        summary["errors"] = ["Previous collection process stopped before completion."]
+        previous.summary = canonical(summary)
+
+
+def refresh_company_coverage(emit=None):
+    """Refresh under the caller's collection lock; retain coverage on source failure."""
+    from .company_discovery import CompanyDiscoveryError, discover_companies
+
+    emit = emit or (lambda message: None)
+    try:
+        result = discover_companies(emit)
+    except CompanyDiscoveryError:
+        # Use fixed text: source exceptions can contain private connection details.
+        emit(COVERAGE_REFRESH_WARNING)
+        return {"status": "unavailable"}, [COVERAGE_REFRESH_WARNING]
+    return {key: value for key, value in result.items() if key != "company_ids"}, []
+
+
+def safe_coverage_warnings(warnings):
+    """Only application-authored warnings may be shown from stored job summaries."""
+    allowed = (COVERAGE_REFRESH_WARNING, INACTIVE_SELECTION_WARNING)
+    if not isinstance(warnings, list):
+        return []
+    return [value for value in warnings if isinstance(value, str) and value in allowed]
+
+
+def sync_all(company_id=None, refresh_coverage=False):
     with sync_lock() as acquired:
         if not acquired:
             return {
                 "status": "busy",
                 "detail": "A registry refresh is already running.",
             }
+        coverage, warnings = refresh_company_coverage() if refresh_coverage else (None, [])
         with Session() as db:
             # Owning the collection lock proves no previous running job is still active.
-            db.execute(
-                update(Job)
-                .where(Job.status == "running")
-                .values(
-                    status="interrupted",
-                    finished_at=now(),
-                    summary=canonical(
-                        {
-                            "errors": [
-                                {
-                                    "error": "Previous collection process stopped before completion."
-                                }
-                            ]
-                        }
-                    ),
-                )
-            )
+            interrupt_running_jobs(db)
             job = Job()
             db.add(job)
             db.commit()
-            companies = db.scalars(
-                select(Company).where(Company.id == company_id)
-                if company_id
-                else select(Company)
-            ).all()
-            totals = {"companies": 0, "studies": 0, "changes": 0, "errors": []}
+            query = select(Company).where(Company.coverage_status == "active")
+            if company_id is not None:
+                query = query.where(Company.id == company_id)
+                selected = db.get(Company, company_id)
+                if selected is not None and selected.coverage_status != "active":
+                    warnings.append(INACTIVE_SELECTION_WARNING)
+            companies = db.scalars(query).all()
+            totals = {"companies": 0, "studies": 0, "changes": 0, "errors": [], "warnings": warnings}
+            if coverage is not None:
+                totals["coverage"] = coverage
             for company in companies:
                 try:
                     rows = fetch_company(company)

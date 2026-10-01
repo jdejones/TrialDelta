@@ -1,59 +1,52 @@
-import hashlib
 import json
 import os
-import re
-import threading
-import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from .db import (
     initialize,
     get_db,
-    Session,
     Company,
     Study,
     Snapshot,
     Evidence,
     Change,
     User,
-    Login,
     Follow,
-    Job,
-    now,
 )
 from .auth import (
     MODE,
     ORIGIN,
-    SECURE,
     bootstrap,
     current_user,
+    browsing_user,
     admin,
-    verify_password,
-    password_hash,
-    new_session,
 )
-from .seed import seed
 from .services import (
     as_dict,
     period,
     CATEGORIES,
     published_changes,
+    change_visible,
+    change_needs_review,
     change_dict,
-    approve_evidence,
+    review_item as review_saved_item,
     reconciliation,
 )
-from .registry import sync_all
-from .inbox import SourceCandidate, import_news
+
+from .home import FILING_PAGE_SIZES, recent_filings, recent_news, recent_trials
+from .tad import list_target_action_dates
 
 ROOT = Path(__file__).parent
 
@@ -61,7 +54,6 @@ ROOT = Path(__file__).parent
 @asynccontextmanager
 async def lifespan(app):
     initialize()
-    seed()
     bootstrap()
     yield
 
@@ -123,135 +115,32 @@ def health(db=Depends(get_db)):
     return {"status": "ok", "version": "0.1.0"}
 
 
-@app.get("/api/me")
-def me(user=Depends(current_user)):
-    return {
-        "id": user.id,
-        "email": user.email,
-        "is_admin": user.is_admin,
-        "mode": MODE,
-        "digest_enabled": user.digest_enabled,
-    }
+from .accounts import router as account_router
+
+app.include_router(account_router)
 
 
-class Credentials(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
-    password: str = Field(min_length=1, max_length=256)
-
-
-_attempts = {}
-_auth_lock = threading.Lock()
-
-
-def throttle(request):
-    key = request.client.host
-    with _auth_lock:
-        cutoff = time.monotonic() - 900
-        for address in list(_attempts):
-            _attempts[address] = [t for t in _attempts[address] if t > cutoff]
-            if not _attempts[address]:
-                del _attempts[address]
-        attempts = _attempts.setdefault(key, [])
-        if len(attempts) >= 15:
-            raise HTTPException(429, "Too many attempts. Try again in 15 minutes.")
-        attempts.append(time.monotonic())
-
-
-@app.post("/api/login")
-def login(body: Credentials, request: Request, response: Response, db=Depends(get_db)):
-    throttle(request)
-    user = db.scalar(select(User).where(User.email == body.email.lower().strip()))
-    if (
-        not user
-        or user.email == "local@trialdelta.local"
-        or not verify_password(body.password, user.password_hash)
-    ):
-        raise HTTPException(401, "Email or password is incorrect")
-    token = new_session(db, user)
-    response.set_cookie(
-        "td_session",
-        token,
-        httponly=True,
-        secure=SECURE,
-        samesite="lax",
-        max_age=604800,
-        path="/",
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, exc):
+    # Pydantic's default error includes the submitted value, which could be a
+    # password or a one-time token. Keep useful field messages without secrets.
+    return JSONResponse(
+        {"detail": [
+            {"loc": error["loc"], "msg": error["msg"], "type": error["type"]}
+            for error in exc.errors()
+        ]},
+        status_code=422,
     )
-    return {"ok": True}
-
-
-@app.post("/api/logout")
-def logout(request: Request, response: Response, db=Depends(get_db)):
-    token = request.cookies.get("td_session", "")
-    row = db.get(Login, hashlib.sha256(token.encode()).hexdigest())
-    if row:
-        db.delete(row)
-        db.commit()
-    response.delete_cookie("td_session", path="/")
-    return {"ok": True}
-
-
-@app.post("/api/users")
-def create_user(body: Credentials, user=Depends(admin), db=Depends(get_db)):
-    if len(body.password) < 14 or not re.fullmatch(
-        r"[^\s@]+@[^\s@]+\.[^\s@]+", body.email
-    ):
-        raise HTTPException(
-            422, "Valid email and a password of at least 14 characters required"
-        )
-    if db.scalar(select(User).where(User.email == body.email.lower().strip())):
-        raise HTTPException(409, "Account already exists")
-    row = User(
-        email=body.email.lower().strip(), password_hash=password_hash(body.password)
-    )
-    db.add(row)
-    db.commit()
-    return {"id": row.id, "email": row.email}
-
-
-@app.get("/api/overview")
-def overview(user=Depends(current_user), db=Depends(get_db)):
-    counts = {
-        key: db.scalar(select(func.count()).select_from(model))
-        for key, model in [
-            ("companies", Company),
-            ("studies", Study),
-            ("snapshots", Snapshot),
-        ]
-    }
-    counts["changes"] = db.scalar(
-        select(func.count())
-        .select_from(Change)
-        .where(Change.review_status == "approved")
-    )
-    counts["pending"] = db.scalar(
-        select(func.count())
-        .select_from(Change)
-        .where(Change.review_status == "pending")
-    ) + db.scalar(
-        select(func.count())
-        .select_from(Evidence)
-        .where(Evidence.review_status == "pending")
-    )
-    counts["follows"] = db.scalar(
-        select(func.count()).select_from(Follow).where(Follow.user_id == user.id)
-    )
-    job = db.scalar(select(Job).order_by(Job.id.desc()).limit(1))
-    return {
-        **counts,
-        "last_job": as_dict(job) if job else None,
-        "today": datetime.now(timezone.utc).date().isoformat(),
-    }
 
 
 @app.get("/api/companies")
-def companies(user=Depends(current_user), db=Depends(get_db)):
+def companies(user=Depends(browsing_user), db=Depends(get_db)):
     follows = {
         f.value
         for f in db.scalars(
             select(Follow).where(Follow.user_id == user.id, Follow.kind == "company")
         )
-    }
+    } if user else set()
     totals = dict(
         db.execute(
             select(Study.company_id, func.count()).group_by(Study.company_id)
@@ -259,19 +148,63 @@ def companies(user=Depends(current_user), db=Depends(get_db)):
     )
     return [
         {
-            **as_dict(c),
+            **{k: v for k, v in as_dict(c).items() if k not in ("last_checked", "last_error")},
             "followed": str(c.id) in follows,
             "study_count": totals.get(c.id, 0),
+            "coverage_label": _coverage_label(c.coverage_status),
         }
         for c in db.scalars(select(Company).order_by(Company.name))
     ]
+
+
+def _coverage_label(status):
+    return {"active": "Active", "delisted": "Delisted", "out_of_sector": "Outside Healthcare"}.get(status, "Active")
+
+
+@app.get("/api/home/trials")
+def home_trials(user=Depends(browsing_user), db=Depends(get_db)):
+    return recent_trials(db)
+
+
+@app.get("/api/home/news")
+def home_news(user=Depends(browsing_user), db=Depends(get_db)):
+    try:
+        return recent_news(db)
+    except SQLAlchemyError:
+        # Connection details and raw source errors belong outside the browser.
+        raise HTTPException(503, "Biotechnology news is temporarily unavailable.") from None
+
+
+@app.get("/api/home/tads")
+def home_tads(user=Depends(browsing_user), db=Depends(get_db)):
+    """Read saved results only; source imports belong to the administrator."""
+    try:
+        return list_target_action_dates(db, limit=500)["items"]
+    except SQLAlchemyError:
+        raise HTTPException(503, "Target action dates are temporarily unavailable.") from None
+
+
+@app.get("/api/home/filings")
+def home_filings(
+    page: int = Query(default=1, ge=1, le=2147483647),
+    page_size: int = Query(default=10, ge=1, le=100),
+    q: str = Query(default="", max_length=200),
+    user=Depends(browsing_user),
+    db=Depends(get_db),
+):
+    if page_size not in FILING_PAGE_SIZES:
+        raise HTTPException(422, "Select 10, 25, 50, or 100 filings per page.")
+    try:
+        return recent_filings(db, page=page, page_size=page_size, q=q)
+    except SQLAlchemyError:
+        raise HTTPException(503, "8-K filings are temporarily unavailable.") from None
 
 
 @app.get("/api/studies")
 def studies(
     q: str = "",
     company_id: int | None = None,
-    user=Depends(current_user),
+    user=Depends(browsing_user),
     db=Depends(get_db),
 ):
     query = select(Study).order_by(Study.last_checked.desc(), Study.id)
@@ -294,16 +227,19 @@ def studies(
             "targets": json.loads(s.targets),
             "ticker": companies[s.company_id].ticker,
             "company": companies[s.company_id].name,
+            "coverage_status": companies[s.company_id].coverage_status,
+            "coverage_label": _coverage_label(companies[s.company_id].coverage_status),
         }
         for s in rows
     ]
 
 
 @app.get("/api/studies/{study_id}")
-def study_detail(study_id: str, user=Depends(current_user), db=Depends(get_db)):
+def study_detail(study_id: str, user=Depends(browsing_user), db=Depends(get_db)):
     row = db.get(Study, study_id)
     if not row:
         raise HTTPException(404, "Trial not found")
+    company = db.get(Company, row.company_id)
     snapshots = db.scalars(
         select(Snapshot)
         .where(Snapshot.study_id == study_id)
@@ -316,6 +252,11 @@ def study_detail(study_id: str, user=Depends(current_user), db=Depends(get_db)):
     ).all()
     return {
         "study": as_dict(row),
+        "company": {
+            "id": company.id, "ticker": company.ticker, "name": company.name,
+            "coverage_status": company.coverage_status,
+            "coverage_label": _coverage_label(company.coverage_status),
+        },
         "reconciliation": reconciliation(db, study_id),
         "snapshots": [
             {k: v for k, v in as_dict(s).items() if k not in ("raw_json", "normalized")}
@@ -323,7 +264,7 @@ def study_detail(study_id: str, user=Depends(current_user), db=Depends(get_db)):
         ],
         "guidance": [as_dict(e) for e in evidence],
         "changes": [
-            c for c in published_changes(db, user.id) if c["study_id"] == study_id
+            c for c in published_changes(db, user.id if user else None) if c["study_id"] == study_id
         ],
     }
 
@@ -351,13 +292,18 @@ def targets(study_id: str, body: TargetBody, user=Depends(admin), db=Depends(get
 
 @app.get("/api/changes")
 def changes(
-    followed: bool = False,
+    followed: bool | None = None,
     category: str = "",
     q: str = "",
-    user=Depends(current_user),
+    user=Depends(browsing_user),
     db=Depends(get_db),
 ):
-    rows = published_changes(db, user.id, followed)
+    # Members default to their watchlist; visitors explore published changes.
+    if followed is None:
+        followed = user is not None
+    if followed and user is None:
+        return []
+    rows = published_changes(db, user.id if user else None, followed)
     if category:
         rows = [r for r in rows if r["category"] == category]
     if q:
@@ -366,9 +312,12 @@ def changes(
 
 
 @app.get("/api/changes/{change_id}")
-def change_detail(change_id: int, user=Depends(current_user), db=Depends(get_db)):
-    row = db.get(Change, change_id)
-    if not row or (row.review_status != "approved" and not user.is_admin):
+def change_detail(change_id: int, user=Depends(browsing_user), db=Depends(get_db)):
+    query = select(Change).where(Change.id == change_id)
+    if not user or not user.is_admin:
+        query = query.where(change_visible())
+    row = db.scalar(query)
+    if not row:
         raise HTTPException(404, "Change not found")
     evidence = []
     for label, key, model in [
@@ -380,6 +329,10 @@ def change_detail(change_id: int, user=Depends(current_user), db=Depends(get_db)
         pk = getattr(row, key)
         if pk:
             e = db.get(model, pk)
+            if e is None:
+                continue
+            if isinstance(e, Evidence) and e.review_status != "approved" and (not user or not user.is_admin):
+                continue
             item = as_dict(e)
             item.pop("raw_json", None)
             if isinstance(e, Snapshot):
@@ -399,7 +352,7 @@ def change_detail(change_id: int, user=Depends(current_user), db=Depends(get_db)
 
 
 @app.get("/api/snapshots/{snapshot_id}")
-def snapshot(snapshot_id: int, user=Depends(current_user), db=Depends(get_db)):
+def snapshot(snapshot_id: int, user=Depends(browsing_user), db=Depends(get_db)):
     row = db.get(Snapshot, snapshot_id)
     if not row:
         raise HTTPException(404, "Snapshot not found")
@@ -493,7 +446,7 @@ class EvidenceBody(BaseModel):
 
 
 @app.post("/api/evidence")
-def add_evidence(body: EvidenceBody, user=Depends(admin), db=Depends(get_db)):
+def add_evidence(body: EvidenceBody, user=Depends(current_user), db=Depends(get_db)):
     if not db.get(Company, body.company_id):
         raise HTTPException(404, "Company not found")
     if body.published_at > datetime.now(timezone.utc).date():
@@ -529,7 +482,7 @@ def review(user=Depends(admin), db=Depends(get_db)):
             change_dict(db, c)
             for c in db.scalars(
                 select(Change)
-                .where(Change.review_status == "pending")
+                .where(change_needs_review())
                 .order_by(Change.id.desc())
             )
         ],
@@ -561,48 +514,7 @@ def review_item(
     user=Depends(admin),
     db=Depends(get_db),
 ):
-    row = db.get(Evidence if kind == "evidence" else Change, item_id)
-    if not row:
-        raise HTTPException(404, "Item not found")
-    if row.review_status != "pending":
-        raise HTTPException(409, "Item already reviewed")
-    if kind == "evidence" and body.action == "approve":
-        return approve_evidence(db, row, user.id)
-    model = Evidence if kind == "evidence" else Change
-    status = "approved" if body.action == "approve" else "rejected"
-    values = {"review_status": status, "reviewed_by": user.id, "reviewed_at": now()}
-    if kind == "change":
-        values.update(reviewed=body.action == "approve", review_note=body.note)
-    result = db.execute(
-        update(model)
-        .where(model.id == item_id, model.review_status == "pending")
-        .values(**values)
-    )
-    if result.rowcount != 1:
-        db.rollback()
-        raise HTTPException(409, "Item already reviewed")
-    db.commit()
-    return {"status": status}
-
-
-@app.post("/api/sync")
-def sync(
-    background: BackgroundTasks,
-    company_id: int | None = None,
-    user=Depends(admin),
-    db=Depends(get_db),
-):
-    if company_id and not db.get(Company, company_id):
-        raise HTTPException(404, "Company not found")
-    background.add_task(sync_all, company_id)
-    return {"status": "queued"}
-
-
-@app.get("/api/jobs")
-def jobs(user=Depends(current_user), db=Depends(get_db)):
-    return [
-        as_dict(j) for j in db.scalars(select(Job).order_by(Job.id.desc()).limit(20))
-    ]
+    return review_saved_item(db, kind, item_id, body.action, body.note, user.id)
 
 
 @app.get("/api/digest")
@@ -648,42 +560,3 @@ def digest_prefs(body: DigestPrefs, user=Depends(current_user), db=Depends(get_d
         "enabled": row.digest_enabled,
         "smtp_configured": bool(os.getenv("SMTP_HOST")),
     }
-
-
-@app.get("/api/inbox")
-def inbox(user=Depends(admin), db=Depends(get_db)):
-    companies = {c.id: c for c in db.scalars(select(Company))}
-    return [
-        {
-            **as_dict(r),
-            "company": companies[r.company_id].name,
-            "ticker": companies[r.company_id].ticker,
-        }
-        for r in db.scalars(
-            select(SourceCandidate)
-            .where(SourceCandidate.status == "unreviewed")
-            .order_by(SourceCandidate.published_at.desc())
-            .limit(500)
-        )
-    ]
-
-
-@app.post("/api/inbox/import")
-def import_sources(user=Depends(admin)):
-    try:
-        return import_news()
-    except Exception:
-        raise HTTPException(
-            503,
-            "The optional news database is unavailable. Registry collection and manual evidence still work.",
-        )
-
-
-@app.post("/api/inbox/{candidate_id}/dismiss")
-def dismiss_candidate(candidate_id: int, user=Depends(admin), db=Depends(get_db)):
-    row = db.get(SourceCandidate, candidate_id)
-    if not row:
-        raise HTTPException(404, "Source candidate not found")
-    row.status = "dismissed"
-    db.commit()
-    return {"ok": True}

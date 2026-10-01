@@ -4,7 +4,11 @@
   "version": "0.1.0",
   "description": "Optional browser smoke tests; the application does not require Node.js",
   "scripts": {
-    "test:browser": "node scripts/browser_check.cjs"
+    "test:browser": "node scripts/browser_check.cjs",
+    "test:accounts": "node scripts/account_browser_check.cjs",
+    "test:visitors": "node scripts/visitor_browser_check.cjs",
+    "test:healthcare": "node scripts/healthcare_browser_check.cjs",
+    "test:filings": "node scripts/home_filings_browser_check.cjs"
   },
   "devDependencies": {
     "playwright": "1.62.1"

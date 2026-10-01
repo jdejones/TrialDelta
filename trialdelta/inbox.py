@@ -9,32 +9,12 @@ import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    Text,
-    ForeignKey,
     select,
     text,
     bindparam,
     create_engine,
 )
-from .db import Base, Company, Session, engine, now
-
-
-class SourceCandidate(Base):
-    __tablename__ = "td_source_inbox"
-    id = Column(Integer, primary_key=True)
-    company_id = Column(
-        Integer, ForeignKey("td_companies.id"), nullable=False, index=True
-    )
-    title = Column(Text, nullable=False)
-    url = Column(Text, nullable=False)
-    source = Column(String(200))
-    published_at = Column(String(40))
-    discovered_at = Column(String(40), default=now)
-    identity = Column(String(64), nullable=False, unique=True)
-    status = Column(String(20), nullable=False, default="unreviewed")
+from .db import Company, SourceCandidate, Session, engine
 
 
 def import_news():

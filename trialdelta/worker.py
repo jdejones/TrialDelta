@@ -4,15 +4,10 @@ import argparse
 import json
 import os
 import time
-from .db import initialize
-from .seed import seed
-from .auth import bootstrap
-from .registry import sync_all
-from .digest import deliver_daily
-from .inbox import import_news
+from .worker_health import UnmonitoredRun, WorkerHealth
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Collect TrialDelta registry snapshots"
     )
@@ -28,13 +23,28 @@ def main():
         action="store_true",
         help="Read source candidates from the optional existing news database",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    # Include startup/configuration failures in the continuous worker's health.
+    monitor = UnmonitoredRun() if args.once else WorkerHealth()
+    with monitor as health:
+        _run(args, health)
+
+
+def _run(args, health):
+    from .db import initialize
+    from .seed import seed
+    from .auth import bootstrap
+    from .registry import sync_all
+    from .digest import deliver_daily
+    from .inbox import import_news
+
     initialize()
     seed()
     bootstrap()
     interval = max(1, float(os.getenv("SYNC_INTERVAL_HOURS", "24"))) * 3600
     while True:
-        print(json.dumps(sync_all(args.company_id)), flush=True)
+        health.update("collecting")
+        print(json.dumps(sync_all(args.company_id, refresh_coverage=True)), flush=True)
         if args.import_news:
             try:
                 print(json.dumps(import_news()), flush=True)
@@ -50,6 +60,7 @@ def main():
                 )
         if args.once:
             break
+        health.update("waiting", next_run_at=time.time() + interval)
         time.sleep(interval)
 
 

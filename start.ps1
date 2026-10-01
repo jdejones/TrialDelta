@@ -18,7 +18,7 @@ if (Test-Path -LiteralPath $statePath) {
     }
 }
 if (-not $processes.ContainsKey('server')) {
-    & $python -c "from trialdelta.app import app; from trialdelta.db import initialize; from trialdelta.seed import seed; from trialdelta.auth import bootstrap; initialize(); seed(); bootstrap()"
+    & $python -c "from trialdelta.app import app; from trialdelta.db import initialize; from trialdelta.auth import bootstrap; initialize(); bootstrap()"
     if ($LASTEXITCODE -ne 0) { throw 'Database initialization failed; no background processes started.' }
     $server = Start-Process -FilePath $python -ArgumentList '-m','uvicorn','trialdelta.app:app','--host','127.0.0.1','--port','8765','--no-proxy-headers' -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -RedirectStandardOutput 'data\server.log' -RedirectStandardError 'data\server-error.log' -PassThru
     $processes['server'] = $server.Id

@@ -41,7 +41,7 @@ def test_follow_idempotent_and_scoped(client, db):
     assert client.get("/api/follows").json() == []
     assert client.delete("/api/follows/" + str(a["id"])).status_code == 404
     assert client.get("/api/review").status_code == 403
-    assert client.post("/api/sync").status_code == 403
+    assert client.post("/api/sync").status_code == 404
 
 
 def test_invalid_evidence_url(client, db):

@@ -5,6 +5,7 @@ services:
     env_file: .env
     environment:
       APP_MODE: hosted
+      AUTH_REQUIRED: "true"
       COOKIE_SECURE: "true"
       USE_LOCAL_MYSQL: "false"
     command:
@@ -39,6 +40,7 @@ services:
       timeout: 6s
       retries: 3
   worker:
+    profiles: ["collection"]
     build: .
     restart: unless-stopped
     command: ["python", "-m", "trialdelta.worker"]

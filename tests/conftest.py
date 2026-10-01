@@ -9,16 +9,20 @@ os.environ["DATABASE_URL"] = "sqlite:///" + str(
 os.environ["USE_LOCAL_MYSQL"] = "false"
 os.environ["APP_MODE"] = "local"
 os.environ["APP_ORIGIN"] = "http://127.0.0.1:8765"
+os.environ["AUTH_REQUIRED"] = "false"
 
 import pytest
 from fastapi.testclient import TestClient
-from trialdelta.db import Base, engine, Session, Company, Study
+from trialdelta.db import Base, engine, Session, Company, Study, initialize
+from trialdelta.seed import seed
 from trialdelta.app import app
 
 
 @pytest.fixture
 def client():
     Base.metadata.drop_all(engine)
+    initialize()
+    seed()
     with TestClient(app) as c:
         c.headers["X-TrialDelta-Client"] = "web"
         yield c

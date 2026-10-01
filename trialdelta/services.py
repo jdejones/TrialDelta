@@ -2,9 +2,9 @@ import calendar
 import json
 import re
 from datetime import date, datetime, timedelta, timezone
-from sqlalchemy import select, func, update
+from sqlalchemy import and_, or_, select, func, update
 from fastapi import HTTPException
-from .db import Company, Study, Snapshot, Evidence, Change, Follow, now
+from .db import Company, Study, Snapshot, Evidence, Change, Follow, User, now
 
 CATEGORIES = {
     "timeline",
@@ -81,10 +81,10 @@ def matches_follow(change, study, follows):
     return False
 
 
-def change_dict(db, change):
+def change_dict(db, change, company=None, study=None):
     item = as_dict(change)
-    company = db.get(Company, change.company_id)
-    study = db.get(Study, change.study_id) if change.study_id else None
+    company = company or db.get(Company, change.company_id)
+    study = study or (db.get(Study, change.study_id) if change.study_id else None)
     item.update(
         company=company.name,
         ticker=company.ticker,
@@ -94,26 +94,58 @@ def change_dict(db, change):
     return item
 
 
+def registry_change_visible():
+    """Registry comparisons publish automatically only with both saved versions."""
+    return and_(
+        Change.source == "registry",
+        Change.review_status.in_(("automatic", "pending", "approved")),
+        Change.before_snapshot != Change.after_snapshot,
+        select(Snapshot.id).where(
+            Snapshot.id == Change.before_snapshot,
+            Snapshot.study_id == Change.study_id,
+        ).exists(),
+        select(Snapshot.id).where(
+            Snapshot.id == Change.after_snapshot,
+            Snapshot.study_id == Change.study_id,
+        ).exists(),
+    )
+
+
+def change_visible():
+    return or_(
+        registry_change_visible(),
+        and_(Change.source == "company", Change.review_status == "approved"),
+    )
+
+
+def change_needs_review():
+    return and_(Change.review_status == "pending", ~registry_change_visible())
+
+
 def published_changes(db, user_id, followed=False, day=None):
     query = (
-        select(Change)
-        .where(Change.review_status == "approved")
+        select(Change, Company, Study)
+        .join(Company, Company.id == Change.company_id)
+        .outerjoin(Study, Study.id == Change.study_id)
+        .where(change_visible())
         .order_by(Change.detected_at.desc(), Change.id.desc())
     )
-    rows = db.scalars(query).all()
+    rows = db.execute(query).all()
     if day:
-        # Approval date makes delayed reviews enter the day's digest.
-        rows = [r for r in rows if (r.reviewed_at or r.detected_at).startswith(day)]
+        # Registry events enter on detection; company evidence enters on approval.
+        rows = [
+            row for row in rows
+            if (
+                row[0].detected_at if row[0].source == "registry"
+                else (row[0].reviewed_at or row[0].detected_at)
+            ).startswith(day)
+        ]
     if followed:
         follows = db.scalars(select(Follow).where(Follow.user_id == user_id)).all()
         rows = [
-            r
-            for r in rows
-            if matches_follow(
-                r, db.get(Study, r.study_id) if r.study_id else None, follows
-            )
+            row for row in rows if matches_follow(row[0], row[2], follows)
         ]
-    return [change_dict(db, r) for r in rows]
+    return [change_dict(db, change, company, study) for change, company, study in rows]
 
 
 def approve_evidence(db, record, user_id):
@@ -178,6 +210,39 @@ def approve_evidence(db, record, user_id):
     }
 
 
+def review_item(db, kind, item_id, action, note, user_id):
+    """Shared administrator review transaction for the desktop and HTTP clients."""
+    reviewer = db.get(User, user_id)
+    if not reviewer or not reviewer.is_admin:
+        raise HTTPException(403, "Reviewer access required")
+    if kind not in ("evidence", "change") or action not in ("approve", "reject"):
+        raise HTTPException(422, "Unknown review operation")
+    if len(note) > 2000:
+        raise HTTPException(422, "Review note must be at most 2000 characters")
+    model = Evidence if kind == "evidence" else Change
+    row = db.get(model, item_id)
+    if not row:
+        raise HTTPException(404, "Item not found")
+    if row.review_status != "pending":
+        raise HTTPException(409, "Item already reviewed")
+    if kind == "evidence" and action == "approve":
+        return approve_evidence(db, row, user_id)
+    status = "approved" if action == "approve" else "rejected"
+    values = {"review_status": status, "reviewed_by": user_id, "reviewed_at": now()}
+    if kind == "change":
+        values.update(reviewed=action == "approve", review_note=note)
+    result = db.execute(
+        update(model)
+        .where(model.id == item_id, model.review_status == "pending")
+        .values(**values)
+    )
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(409, "Item already reviewed")
+    db.commit()
+    return {"status": status}
+
+
 def reconciliation(db, study_id):
     if not study_id:
         return {
@@ -205,11 +270,11 @@ def reconciliation(db, study_id):
         else "Registry versions are available for comparison. Check the field-level change log."
     )
     if not fresh:
-        message = "Registry check is stale or unavailable. Refresh before reconciling."
+        message = "The saved registry record has not been checked recently. Consult the original source before relying on its current status."
     company = db.get(Company, study.company_id)
     if company.last_error:
         status = "error"
-        message = "The latest registry refresh failed. The last successful snapshot is preserved; refresh before reconciling."
+        message = "The latest source check was unsuccessful. The last saved registry record is shown."
     return {
         "status": status,
         "message": message,
