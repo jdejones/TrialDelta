@@ -1,0 +1,84 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_MODE: hosted
+      COOKIE_SECURE: "true"
+      USE_LOCAL_MYSQL: "false"
+    command:
+      [
+        "python",
+        "-m",
+        "uvicorn",
+        "trialdelta.app:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--proxy-headers",
+        "--forwarded-allow-ips",
+        "172.30.68.2",
+      ]
+    networks:
+      private: {}
+    volumes:
+      - trialdelta-data:/app/data
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,os,urllib.parse; r=urllib.request.Request('http://127.0.0.1:8000/api/health',headers={'Host':urllib.parse.urlparse(os.environ['APP_ORIGIN']).netloc}); urllib.request.urlopen(r,timeout=5)",
+        ]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "trialdelta.worker"]
+    networks:
+      private: {}
+    env_file: .env
+    environment:
+      APP_MODE: hosted
+      COOKIE_SECURE: "true"
+      USE_LOCAL_MYSQL: "false"
+    volumes:
+      - trialdelta-data:/app/data
+    depends_on:
+      app:
+        condition: service_healthy
+  proxy:
+    image: caddy:2.10-alpine
+    networks:
+      private:
+        ipv4_address: 172.30.68.2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env before public deployment}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+volumes:
+  trialdelta-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  private:
+    ipam:
+      config:
+        - subnet: 172.30.68.0/24

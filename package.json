@@ -1,0 +1,12 @@
+{
+  "name": "trialdelta-browser-checks",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Optional browser smoke tests; the application does not require Node.js",
+  "scripts": {
+    "test:browser": "node scripts/browser_check.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
