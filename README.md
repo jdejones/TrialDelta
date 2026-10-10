@@ -1,3 +1,5 @@
+This app is now hosted at trialdelta-derekjones.duckdns.org. This repo contains connectors to live data feeds that are not distributed by the hosted site during early development. There are snapshots of delayed data that allow browsing of the apps features at the hosted site.
+
 # TrialDelta
 
 A local-first research workspace for tracking **what changed** in healthcare companies and clinical programs across therapeutic areas. TrialDelta preserves the evidence behind a change and keeps registry milestones separate from company readout guidance.
