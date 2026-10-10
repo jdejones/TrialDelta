@@ -2,6 +2,11 @@ services:
   app:
     build: .
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     env_file: .env
     environment:
       APP_MODE: hosted
@@ -23,7 +28,8 @@ services:
         "172.30.68.2",
       ]
     networks:
-      private: {}
+      private:
+        ipv4_address: 172.30.68.3
     volumes:
       - trialdelta-data:/app/data
     expose:
@@ -58,6 +64,11 @@ services:
         condition: service_healthy
   proxy:
     image: caddy:2.10-alpine
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       private:
         ipv4_address: 172.30.68.2

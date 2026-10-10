@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -284,6 +285,7 @@ def valid_token(db, token, purpose):
 @router.get("/api/auth/config")
 def auth_config():
     return {
+        "portfolio_snapshot_date": os.getenv("PORTFOLIO_SNAPSHOT_DATE", ""),
         "auth_required": auth.authentication_required(),
         "registration_enabled": auth.REGISTRATION_ENABLED,
         "public_browsing_enabled": auth.PUBLIC_BROWSING_ENABLED,

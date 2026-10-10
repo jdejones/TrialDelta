@@ -1,13 +1,13 @@
 """Read-only Home feeds over records already stored by the owner's pipelines."""
 
 import json
-import os
 from urllib.parse import urlparse
 
-from sqlalchemy import DateTime, bindparam, create_engine, func, select, text
+from sqlalchemy import DateTime, bindparam, func, select, text
 
 from .db import Company, Snapshot, Study, engine
 from .services import as_dict
+from .portfolio_sources import safe_source_url, source_engine, source_table, sqlite_public_urls
 
 
 FEED_LIMIT = 100
@@ -45,34 +45,7 @@ def recent_trials(db):
 
 
 def _source_engine():
-    source_url = os.getenv("SOURCE_DATABASE_URL")
-    if source_url:
-        return create_engine(source_url, pool_pre_ping=True)
-    if os.getenv("USE_LOCAL_MYSQL", "false").lower() == "true":
-        return engine
-    return None
-
-
-def safe_source_url(value):
-    """Only expose ordinary web links, even if the source data is malformed."""
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if not value or "\\" in value or any(c.isspace() or ord(c) < 32 for c in value):
-        return None
-    try:
-        parsed = urlparse(value)
-        if (
-            parsed.scheme not in ("http", "https")
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
-            return None
-        parsed.port  # Validate malformed ports without exposing the parse error.
-    except ValueError:
-        return None
-    return value
+    return source_engine(engine)
 
 
 def recent_filings(db, *, page=1, page_size=10, q=""):
@@ -99,10 +72,11 @@ def recent_filings(db, *, page=1, page_size=10, q=""):
     source_engine = _source_engine()
     if source_engine is None:
         return result
+    table = source_table(source_engine, "filings")
     try:
         with source_engine.connect() as connection:
             total = connection.execute(
-                text("SELECT COUNT(*) FROM filings.biotech_filings WHERE " + where)
+                text("SELECT COUNT(*) FROM " + table + " WHERE " + where)
                 .bindparams(*bindings), parameters
             ).scalar_one()
             total_pages = (total + page_size - 1) // page_size
@@ -113,7 +87,7 @@ def recent_filings(db, *, page=1, page_size=10, q=""):
             rows = connection.execute(
                 text(
                     "SELECT symbol, form_type, accession_no, filed_at, filing_link "
-                    "FROM filings.biotech_filings WHERE " + where + " "
+                    "FROM " + table + " WHERE " + where + " "
                     "ORDER BY filed_at IS NULL, filed_at DESC, accession_no DESC, "
                     "symbol, filing_link, form_type LIMIT :page_size OFFSET :offset"
                 ).bindparams(*bindings).columns(filed_at=DateTime()),
@@ -146,6 +120,10 @@ def recent_news(db):
     source_engine = _source_engine()
     if source_engine is None:
         return []
+    if source_table(source_engine, "news") == "td_portfolio_news":
+        if source_engine is not engine:
+            source_engine.dispose()
+        return paged_news(db, page_size=FEED_LIMIT)["items"]
     # This feed uses the biotechnology industry classification from the existing
     # security reference table, independent of any company therapeutic area.
     query = text(
@@ -192,5 +170,77 @@ def recent_news(db):
         )
         if len(result) == FEED_LIMIT:
             break
+    return result
+
+
+def paged_news(db, *, page=1, page_size=10, q=""):
+    """Browse every eligible snapshot headline, deduplicating before paging."""
+    result = {"items": [], "page": 1, "page_size": page_size, "total": 0, "total_pages": 0}
+    source = _source_engine()
+    if source is None:
+        return result
+    table = source_table(source, "news")
+    if table != "td_portfolio_news":
+        if source is not engine:
+            source.dispose()
+        # The established workstation feed remains unchanged.
+        rows = recent_news(db)
+        search = q.strip().casefold()
+        rows = [row for row in rows if not search or any(
+            search in str(row.get(key, "")).casefold()
+            for key in ("title", "ticker", "company", "source")
+        )]
+        total = len(rows)
+        pages = (total + page_size - 1) // page_size
+        page = min(page, max(1, pages))
+        return {**result, "items": rows[(page - 1) * page_size:page * page_size],
+                "page": page, "total": total, "total_pages": pages}
+
+    cte = (
+        "WITH candidates AS (SELECT id, Title, Source, Date, "
+        "UPPER(TRIM(Ticker)) AS ticker, td_public_url(Url) AS url FROM " + table +
+        " WHERE Date IS NOT NULL), ranked AS (SELECT *, ROW_NUMBER() OVER ("
+        "PARTITION BY ticker, url ORDER BY Date DESC, id DESC) AS duplicate_rank "
+        "FROM candidates WHERE url IS NOT NULL AND ticker <> ''), "
+        "feed AS (SELECT * FROM ranked WHERE duplicate_rank = 1) "
+    )
+    where, parameters, bindings = "1=1", {}, []
+    search = q.strip().lower()
+    if search:
+        parameters["search"] = "%" + search.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+        where = "(LOWER(ticker) LIKE :search ESCAPE '!' OR LOWER(Title) LIKE :search ESCAPE '!' OR LOWER(Source) LIKE :search ESCAPE '!'"
+        company_tickers = db.scalars(select(func.upper(Company.ticker)).where(
+            func.lower(Company.name).contains(search, autoescape=True)
+        )).all()
+        if company_tickers:
+            where += " OR ticker IN :company_tickers"
+            parameters["company_tickers"] = company_tickers
+            bindings.append(bindparam("company_tickers", expanding=True))
+        where += ")"
+    try:
+        with source.connect() as connection:
+            sqlite_public_urls(connection)
+            total = connection.execute(
+                text(cte + "SELECT COUNT(*) FROM feed WHERE " + where).bindparams(*bindings), parameters
+            ).scalar_one()
+            pages = (total + page_size - 1) // page_size
+            page = min(page, max(1, pages))
+            rows = connection.execute(text(
+                cte + "SELECT id, ticker, Title, Source, Date, url FROM feed WHERE " + where +
+                " ORDER BY Date DESC, id DESC LIMIT :limit OFFSET :offset"
+            ).bindparams(*bindings), {**parameters, "limit": page_size, "offset": (page - 1) * page_size}).mappings().all()
+    finally:
+        if source is not engine:
+            source.dispose()
+    names = dict(db.execute(select(func.upper(Company.ticker), Company.name).where(
+        func.upper(Company.ticker).in_([row["ticker"] for row in rows])
+    )).all())
+    result.update(page=page, total=total, total_pages=pages)
+    result["items"] = [{
+        "id": row["id"], "title": row["Title"] or "Untitled article",
+        "ticker": row["ticker"], "company": names.get(row["ticker"], row["ticker"]),
+        "source": row["Source"] or urlparse(row["url"]).hostname,
+        "url": row["url"], "published_at": str(row["Date"]),
+    } for row in rows]
     return result
 

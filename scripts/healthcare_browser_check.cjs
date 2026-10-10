@@ -45,7 +45,18 @@ let browser;
       if (pathname === "/api/auth/config") return respond({ auth_required: false, public_browsing_enabled: false, registration_enabled: false });
       if (pathname === "/api/me") return respond({ id: 993001, display_name: "Healthcare Reader", email: "healthcare@example.org", is_admin: false, mode: "local", digest_enabled: false });
       if (pathname === "/api/companies") return respond(companies.map(c => ({ ...c, followed: false })));
-      if (["/api/studies", "/api/home/trials"].includes(pathname)) return respond(studies);
+      if (pathname === "/api/home/trials") return respond(studies);
+      if (pathname === "/api/studies") {
+        const q = (url.searchParams.get("q") || "").toLowerCase(), companyId = Number(url.searchParams.get("company_id"));
+        const filtered = studies.filter(s => (!companyId || s.company_id === companyId) && (!q || JSON.stringify(s).toLowerCase().includes(q)));
+        const offset = Number(url.searchParams.get("offset") || 0), limit = Number(url.searchParams.get("limit") || 100);
+        return route.fulfill({ status: 200, json: filtered.slice(offset, offset + limit), headers: { "X-Total-Count": String(filtered.length) } });
+      }
+      if (pathname === "/api/themes") {
+        const kind = url.searchParams.get("kind"), q = (url.searchParams.get("q") || "").toLowerCase();
+        const values = [...new Set(studies.flatMap(s => kind === "drug" ? s.drug.split(";").map(v => v.trim()) : kind === "target" ? s.targets : s.conditions))].filter(v => v && (!q || v.toLowerCase().includes(q))).sort();
+        return respond(values);
+      }
       if (["/api/changes", "/api/home/news"].includes(pathname)) return respond([]);
       if (pathname === "/api/follows") return respond(follows);
       const study = studies.find(s => pathname === "/api/studies/" + s.id);
@@ -93,6 +104,7 @@ let browser;
   await search.fill("");
   await page.waitForFunction(() => document.querySelectorAll("tbody tr").length === 3);
   await button("Clinical programs").click();
+  await page.waitForFunction(() => document.querySelectorAll("tbody tr").length === 3);
   assert.equal(await page.locator("tbody tr").count(), 3);
   assert.match(await page.locator("tbody tr").filter({ hasText: "Device study" }).innerText(), /Not applicable/);
   assert.match(await page.locator("tbody tr").filter({ hasText: "Observational study" }).innerText(), /Phase not reported/);
@@ -103,8 +115,10 @@ let browser;
   await page.waitForFunction(() => document.querySelectorAll("tbody tr").length === 3);
 
   await button("Follow a theme").click();
+  await page.waitForFunction(() => document.querySelectorAll("#theme-options option").length === 2);
   assert.deepEqual(await page.locator("#theme-options option").evaluateAll(options => options.map(o => o.value)), ["Cardiac monitoring device", "ONC-101"]);
   await page.locator("#follow-kind").selectOption("indication");
+  await page.waitForFunction(() => document.querySelectorAll("#theme-options option").length === 3);
   assert.deepEqual(await page.locator("#theme-options option").evaluateAll(options => options.map(o => o.value)), ["Heart failure", "Melanoma", "Type 2 diabetes"]);
   await page.locator("#follow-value").fill("Type 2 diabetes");
   await button("Add to watchlist").click();

@@ -475,7 +475,7 @@ def _effective_tad_rows():
     ).outerjoin(TargetActionDateEdit, TargetActionDateEdit.id == latest.c.edit_id).subquery()
 
 
-def list_target_action_dates(db, *, ticker="", status="", limit=100, offset=0, include_identity=False):
+def list_target_action_dates(db, *, ticker="", status="", q="", month="", limit=100, offset=0, include_identity=False):
     """Read a bounded calendar page and its counts, without accessing filings.
 
     Repeated identified symbol/date pairs appear once with source and occurrence
@@ -495,6 +495,17 @@ def list_target_action_dates(db, *, ticker="", status="", limit=100, offset=0, i
         conditions.append(effective.c.status == status)
     elif status:
         raise ValueError("Unknown target action date status.")
+    if month:
+        if not re.fullmatch(r"\d{4}-\d{2}", month):
+            raise ValueError("Use YYYY-MM for the calendar month.")
+        try:
+            date.fromisoformat(month + "-01")
+        except ValueError:
+            raise ValueError("Use a valid calendar month.") from None
+        conditions.append(or_(
+            and_(effective.c.precision == "month", effective.c.tad == month),
+            and_(effective.c.precision == "day", effective.c.tad.startswith(month + "-")),
+        ))
 
     filing_identity = case(
         (effective.c.entry_method == "manual", None),
@@ -525,12 +536,6 @@ def list_target_action_dates(db, *, ticker="", status="", limit=100, offset=0, i
         literal(0).label("edited_count"),
     ).where(*conditions, effective.c.status != "identified")
     grouped = union_all(identified, unresolved).subquery()
-    counts = db.execute(select(
-        func.count().label("total"),
-        func.sum(case((grouped.c.status == "identified", 1), else_=0)).label("identified"),
-        func.sum(case((grouped.c.precision == "month", 1), else_=0)).label("month"),
-        func.sum(case((grouped.c.status != "identified", 1), else_=0)).label("unresolved"),
-    ).select_from(grouped)).mappings().one()
     query = (
         select(TargetActionDate, TargetActionDateEdit, grouped.c.source_count, grouped.c.occurrence_count,
                grouped.c.manual_count, grouped.c.edited_count, Company.name)
@@ -539,12 +544,28 @@ def list_target_action_dates(db, *, ticker="", status="", limit=100, offset=0, i
         .join(effective, effective.c.id == TargetActionDate.id)
         .outerjoin(TargetActionDateEdit, TargetActionDateEdit.id == effective.c.edit_id)
         .outerjoin(Company, Company.ticker == effective.c.symbol)
-        .order_by(
+    )
+    search = q.strip().lower()
+    if search:
+        effective_context = case((TargetActionDateEdit.id.is_not(None), TargetActionDateEdit.notes),
+                                 else_=TargetActionDate.context)
+        query = query.where(or_(*[
+            func.lower(func.coalesce(column, "")).contains(search, autoescape=True)
+            for column in (effective.c.symbol, effective.c.tad, effective.c.status, Company.name,
+                           TargetActionDate.accession_no, effective_context, TargetActionDate.context,
+                           TargetActionDate.matched_text, TargetActionDate.reason)
+        ]))
+    filtered = query.with_only_columns(grouped.c.status, grouped.c.precision).subquery()
+    counts = db.execute(select(
+        func.count().label("total"),
+        func.sum(case((filtered.c.status == "identified", 1), else_=0)).label("identified"),
+        func.sum(case((filtered.c.precision == "month", 1), else_=0)).label("month"),
+        func.sum(case((filtered.c.status != "identified", 1), else_=0)).label("unresolved"),
+    ).select_from(filtered)).mappings().one()
+    query = query.order_by(
             case((effective.c.status == "identified", 0), else_=1),
             effective.c.tad.desc(), effective.c.symbol, TargetActionDate.id,
-        )
-        .offset(offset).limit(limit)
-    )
+        ).offset(offset).limit(limit)
     items = []
     for row, edit, source_count, occurrence_count, manual_count, edited_count, company_name in db.execute(query):
         values = _effective_values(row, edit)

@@ -1,4 +1,5 @@
 import os
+import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,20 @@ if IS_SQLITE:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=10000")
+        def term_match(raw, kind, value):
+            try:
+                terms = json.loads(raw or "[]") if kind == "json" else (raw or "").split(";")
+                return int(any(str(term).strip().casefold() == value.casefold() for term in terms))
+            except (TypeError, ValueError):
+                return 0
+        connection.create_function("td_term_match", 3, term_match, deterministic=True)
+        def terms(raw, kind):
+            try:
+                values = json.loads(raw or "[]") if kind == "json" else (raw or "").split(";")
+                return json.dumps([str(value).strip() for value in values if str(value).strip()])
+            except (TypeError, ValueError):
+                return "[]"
+        connection.create_function("td_terms", 2, terms, deterministic=True)
 
 
 Session = sessionmaker(bind=engine, expire_on_commit=False)
@@ -104,6 +119,11 @@ class Snapshot(Base):
     digest = Column(String(64), nullable=False)
     raw_json = Column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False)
     normalized = Column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False)
+
+
+Index("ix_td_snapshots_study_captured", Snapshot.study_id, Snapshot.captured_at)
+Index("ix_td_studies_checked_desc_id", Study.last_checked.desc(), Study.id)
+Index("ix_td_studies_company_checked_desc", Study.company_id, Study.last_checked.desc(), Study.id)
 
 
 class Evidence(Base):

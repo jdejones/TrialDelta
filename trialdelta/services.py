@@ -2,9 +2,10 @@ import calendar
 import json
 import re
 from datetime import date, datetime, timedelta, timezone
-from sqlalchemy import and_, or_, select, func, update
+from sqlalchemy import and_, or_, select, func, update, case, false
 from fastapi import HTTPException
 from .db import Company, Study, Snapshot, Evidence, Change, Follow, User, now
+from .portfolio_sources import safe_source_url
 
 CATEGORIES = {
     "timeline",
@@ -20,6 +21,16 @@ CATEGORIES = {
 
 def as_dict(row):
     return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
+def public_record(item):
+    """Research reads do not reveal internal attribution or review notes."""
+    result = {key: value for key, value in item.items()
+              if key not in {"created_by", "reviewed_by", "review_note", "entered_by"}}
+    for key in ("url", "filing_link", "original_filing_link", "source_url", "website"):
+        if key in result:
+            result[key] = safe_source_url(result[key])
+    return result
 
 
 def period(text):
@@ -122,7 +133,7 @@ def change_needs_review():
     return and_(Change.review_status == "pending", ~registry_change_visible())
 
 
-def published_changes(db, user_id, followed=False, day=None):
+def published_change_query(db, user_id, followed=False, day=None, study_id=None):
     query = (
         select(Change, Company, Study)
         .join(Company, Company.id == Change.company_id)
@@ -130,22 +141,61 @@ def published_changes(db, user_id, followed=False, day=None):
         .where(change_visible())
         .order_by(Change.detected_at.desc(), Change.id.desc())
     )
-    rows = db.execute(query).all()
+    if study_id:
+        query = query.where(Change.study_id == study_id)
     if day:
-        # Registry events enter on detection; company evidence enters on approval.
-        rows = [
-            row for row in rows
-            if (
-                row[0].detected_at if row[0].source == "registry"
-                else (row[0].reviewed_at or row[0].detected_at)
-            ).startswith(day)
-        ]
+        published_at = case((Change.source == "registry", Change.detected_at),
+                            else_=func.coalesce(Change.reviewed_at, Change.detected_at))
+        query = query.where(published_at.startswith(day, autoescape=True))
     if followed:
         follows = db.scalars(select(Follow).where(Follow.user_id == user_id)).all()
-        rows = [
-            row for row in rows if matches_follow(row[0], row[2], follows)
-        ]
+        conditions = []
+        for follow in follows:
+            value = follow.value.casefold()
+            if follow.kind == "company":
+                if value.isdigit():
+                    conditions.append(Change.company_id == int(value))
+            elif follow.kind == "program":
+                conditions.append(func.lower(Change.study_id) == value)
+            elif follow.kind in ("drug", "target", "indication"):
+                column = {"drug": Study.drug, "target": Study.targets,
+                          "indication": Study.conditions}[follow.kind]
+                if db.get_bind().dialect.name == "sqlite":
+                    conditions.append(func.td_term_match(
+                        column, "split" if follow.kind == "drug" else "json", value
+                    ) == 1)
+                elif follow.kind == "drug":
+                    # Existing MySQL storage is a semicolon-separated term list.
+                    normalized = func.trim(func.regexp_replace(
+                        func.lower(column), "[[:space:]]*;[[:space:]]*", ";"
+                    ))
+                    conditions.append(func.instr(func.concat(";", normalized, ";"), ";" + value + ";") > 0)
+                else:
+                    conditions.append(func.json_contains(func.lower(column), json.dumps(value)) == 1)
+        query = query.where(or_(*conditions) if conditions else false())
+    return query
+
+
+def published_changes(db, user_id, followed=False, day=None, study_id=None):
+    rows = db.execute(published_change_query(db, user_id, followed, day, study_id)).all()
     return [change_dict(db, change, company, study) for change, company, study in rows]
+
+
+def published_changes_page(db, user_id, *, followed=False, category="", q="", limit=100, offset=0):
+    query = published_change_query(db, user_id, followed)
+    if category:
+        query = query.where(Change.category == category)
+    search = q.strip().lower()
+    if search:
+        query = query.where(or_(*[
+            func.lower(func.coalesce(column, "")).contains(search, autoescape=True)
+            for column in (Company.name, Company.ticker, Study.id, Study.title, Study.drug,
+                           Change.title, Change.category, Change.before_value, Change.after_value)
+        ]))
+    total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery()))
+    rows = db.execute(query.limit(limit).offset(offset)).all()
+    return [public_record(change_dict(db, change, company, study))
+            for change, company, study in rows], total
 
 
 def approve_evidence(db, record, user_id):
@@ -254,12 +304,12 @@ def reconciliation(db, study_id):
         select(func.count()).select_from(Snapshot).where(Snapshot.study_id == study_id)
     )
     latest = db.scalar(
-        select(Snapshot)
+        select(Snapshot.normalized)
         .where(Snapshot.study_id == study_id)
         .order_by(Snapshot.id.desc())
         .limit(1)
     )
-    n = json.loads(latest.normalized) if latest else {}
+    n = json.loads(latest) if latest else {}
     fresh = study.last_checked and datetime.fromisoformat(
         study.last_checked
     ) > datetime.now(timezone.utc) - timedelta(hours=48)

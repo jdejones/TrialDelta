@@ -33,7 +33,8 @@ let browser;
   const operationalRequests = [];
   const unexpectedRequests = [];
   const homeRequests = [];
-  let fixtureMode = false;
+  const fixtureOnly = process.env.FIXTURE_ONLY === "1";
+  let fixtureMode = fixtureOnly;
   let readerMode = false;
   let follows = [];
   let submittedEvidence;
@@ -42,27 +43,43 @@ let browser;
   let feedGate;
   page.on("pageerror", (e) => errors.push(e.message));
   page.on("request", (request) => {
-    const pathname = new URL(request.url()).pathname;
+    const url = new URL(request.url());
+    const pathname = url.pathname;
     if (/^\/api\/(overview|sync|jobs|review|inbox)(\/|$)/.test(pathname)) operationalRequests.push(pathname);
   });
   // Check the live landing API first, then use deterministic API fixtures.
   // No mutation is ever allowed to reach the running app or its database.
+  if (fixtureOnly) await page.route("**/*", async route => {
+    const url = new URL(route.request().url());
+    if (url.origin !== "http://trialdelta.test") return route.abort();
+    const files = { "/": ["index.html", "text/html"], "/static/app.js": ["app.js", "text/javascript"], "/static/styles.css": ["styles.css", "text/css"], "/static/base.css": ["base.css", "text/css"], "/static/favicon.svg": ["favicon.svg", "image/svg+xml"] };
+    if (!files[url.pathname]) return route.fallback();
+    const [file, contentType] = files[url.pathname];
+    return route.fulfill({ status: 200, contentType, body: fs.readFileSync(path.join(__dirname, "../trialdelta/static", file)) });
+  });
   await page.route("**/api/**", async (route) => {
     const request = route.request();
-    const pathname = new URL(request.url()).pathname;
+    const url = new URL(request.url());
+    const pathname = url.pathname;
     const method = request.method();
     const respond = (json, status = 200) => route.fulfill({ status, json });
     if (!fixtureMode && method === "GET") return route.continue();
     if (fixtureMode) {
       if (method === "GET" && pathname === "/api/home/tads") return respond([]);
+      if (method === "GET" && pathname === "/api/home/tads/page") return respond({ items: [], total: 0, identified: 0, month: 0, unresolved: 0, limit: Number(url.searchParams.get("limit")), offset: Number(url.searchParams.get("offset")) });
       if (method === "GET" && pathname === "/api/home/filings") return respond({ items: [], page: 1, page_size: 10, total: 0, total_pages: 1 });
-      if (method === "GET" && /^\/api\/home\/(trials|news)$/.test(pathname)) {
-        const tab = pathname.split("/").pop();
+      if (method === "GET" && /^\/api\/home\/(trials|news\/page)$/.test(pathname)) {
+        const tab = pathname === "/api/home/trials" ? "trials" : "news";
         homeRequests.push(tab);
         const mode = feedModes[tab];
         if (mode === "delayed") await feedGate;
         if (mode === "error") return respond({ detail: "The feed is temporarily unavailable." }, 503);
-        return respond(mode === "empty" ? [] : tab === "trials" ? trials : news);
+        if (tab === "trials") return respond(mode === "empty" ? [] : trials);
+        const q = (url.searchParams.get("q") || "").toLowerCase(), size = Number(url.searchParams.get("page_size"));
+        assert.equal(size, 10, "News requests must use bounded pages");
+        const rows = mode === "empty" ? [] : news.filter(row => !q || JSON.stringify(row).toLowerCase().includes(q));
+        const totalPages = Math.max(1, Math.ceil(rows.length / size)), current = Math.min(Number(url.searchParams.get("page")), totalPages);
+        return respond({ items: rows.slice((current - 1) * size, current * size), page: current, page_size: size, total: rows.length, total_pages: totalPages });
       }
       if (method === "GET" && pathname === "/api/auth/config")
         return respond({ auth_required: false, public_browsing_enabled: false, registration_enabled: true, email_delivery_available: false, password_min_length: 14 });
@@ -70,7 +87,12 @@ let browser;
         return respond({ id: 991001, email: "smoke@example.org", display_name: "Smoke Researcher", is_admin: !readerMode, mode: "local", digest_enabled: true, auth_required: false, email_verified: false, email_delivery_available: false, created_at: "2026-09-24T00:00:00+00:00" });
       if (method === "GET" && pathname === "/api/companies")
         return respond([{ ...company, followed: follows.some((f) => f.kind === "company" && f.value === String(company.id)) }]);
-      if (method === "GET" && pathname === "/api/studies") return respond(trials);
+      if (method === "GET" && pathname === "/api/studies") {
+        const q = (url.searchParams.get("q") || "").toLowerCase(), companyId = Number(url.searchParams.get("company_id"));
+        const rows = trials.filter(row => (!companyId || row.company_id === companyId) && (!q || JSON.stringify(row).toLowerCase().includes(q)));
+        const limit = Number(url.searchParams.get("limit") || 100), offset = Number(url.searchParams.get("offset") || 0);
+        return route.fulfill({ status: 200, json: rows.slice(offset, offset + limit), headers: { "X-Total-Count": String(rows.length) } });
+      }
       if (method === "GET" && pathname === "/api/changes") return respond([]);
       if (method === "GET" && pathname === "/api/follows") return respond(follows);
       if (method === "GET" && pathname === "/api/digest")
@@ -131,6 +153,7 @@ let browser;
       assert.equal(await pagination(name).count(), 0, "Single-page and empty feeds need no pagination controls");
     }
   }
+  if (!fixtureOnly) {
   const liveIdentity = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/me");
   await page.goto(process.env.APP_URL || "http://127.0.0.1:8765", { waitUntil: "networkidle" });
   const identity = await liveIdentity;
@@ -156,9 +179,12 @@ let browser;
     await assertReaderInterface();
     await screenshot("home-live-desktop");
   }
+  }
 
   fixtureMode = true;
-  await page.reload({ waitUntil: "networkidle" });
+  fs.mkdirSync(path.join(__dirname, "../artifacts"), { recursive: true });
+  if (fixtureOnly) await page.goto("http://trialdelta.test", { waitUntil: "networkidle" });
+  else await page.reload({ waitUntil: "networkidle" });
   await page.locator(".home-trial-card").first().waitFor();
   assert.deepEqual(homeRequests, ["trials"], "News must load only when selected");
   assert.deepEqual(await page.locator(".home-trial-card h3").allTextContents(), trials.slice(0, 10).map((s) => s.title));
@@ -217,7 +243,8 @@ let browser;
   await assertFeedPage("Trials", 2);
   await tab("News").click();
   await assertFeedPage("News", 3);
-  assert.deepEqual(homeRequests, ["trials", "news"], "Pagination must reuse the cached feeds");
+  assert.equal(homeRequests.filter(tab => tab === "trials").length, 1, "The recent trial collection stays cached");
+  assert.ok(homeRequests.filter(tab => tab === "news").length > 1, "News pages must be requested from the server");
 
   await search.fill("Pagination cohort");
   for (const name of ["News", "Trials"]) {
@@ -274,7 +301,7 @@ let browser;
     feedModes[feed] = "empty";
     await page.reload({ waitUntil: "networkidle" });
     if (feed === "news") await tab("News").click();
-    await heading(feed === "trials" ? "New trials will appear here." : "No biotech news yet.").waitFor();
+    await heading(feed === "trials" ? "New trials will appear here." : "No healthcare news yet.").waitFor();
     await assertFeedPage(feed === "trials" ? "Trials" : "News", 1, []);
     feedModes[feed] = "error";
     await page.reload({ waitUntil: "networkidle" });

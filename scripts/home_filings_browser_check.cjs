@@ -37,6 +37,7 @@ let browser;
       if (pathname === "/api/me") return respond({ id: 996001, display_name: "Filings Reader", email: "filings@example.org", is_admin: false, mode: "local" });
       if (pathname === "/api/companies") return respond([{ id: 996063, ticker: "F063", name: "Filing company 63", study_count: 0, followed: false }]);
       if (["/api/studies", "/api/follows", "/api/changes", "/api/home/trials", "/api/home/news", "/api/home/tads"].includes(pathname)) return respond([]);
+      if (pathname === "/api/home/tads/page") return respond({ items: [], total: 0, identified: 0, month: 0, unresolved: 0, offset: Number(url.searchParams.get("offset") || 0), limit: Number(url.searchParams.get("limit") || 100) });
       if (pathname === "/api/home/filings") {
         const query = url.searchParams.get("q") || "";
         const pageNumber = Number(url.searchParams.get("page"));

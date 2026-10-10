@@ -49,20 +49,24 @@ const trialCountLabel = (count = 0) => `${count} ${count === 1 ? "trial" : "tria
 const HOME_PAGE_SIZE = 10;
 const FILING_PAGE_SIZES = [10, 25, 50, 100];
 const HOME_TABS = { trials: "Trials", news: "News", tads: "Target action dates", filings: "8-Ks", calendar: "Calendar" };
-const homeFeedKey = () => state.homeTab === "calendar" ? "tads" : state.homeTab;
+const homeFeedKey = () => state.homeTab;
 function currentCalendarMonth() {
   const today = new Date();
   return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
 }
 const CHANGE_PAGE_SIZE = 10;
+const PROGRAM_PAGE_SIZE = 25;
 const state = {
   page: "home",
   homeTab: "trials",
   calendarMonth: currentCalendarMonth(),
   homePages: { trials: 1, news: 1, tads: 1, filings: 1 },
-  homeFeeds: { trials: null, news: null, tads: null, filings: null },
-  homeLoading: { trials: false, news: false, tads: false, filings: false },
-  homeErrors: { trials: "", news: "", tads: "", filings: "" },
+  homeFeeds: { trials: null, news: null, tads: null, filings: null, calendar: null },
+  homeLoading: { trials: false, news: false, tads: false, filings: false, calendar: false },
+  homeErrors: { trials: "", news: "", tads: "", filings: "", calendar: "" },
+  homeRequests: { news: 0, tads: 0, calendar: 0 },
+  calendarUnresolvedPage: 1,
+  calendarUnresolvedOpen: false,
   filingsPageSize: HOME_PAGE_SIZE,
   filingsRequest: 0,
   demo: false,
@@ -72,6 +76,15 @@ const state = {
   changeLoading: false,
   changeError: "",
   changeRequest: 0,
+  changeKey: "",
+  changeTotal: 0,
+  programPage: 1,
+  programTotal: 0,
+  programCompany: null,
+  programKey: "",
+  programLoading: false,
+  programError: "",
+  programRequest: 0,
   q: "",
   me: null,
   companies: [],
@@ -137,6 +150,7 @@ function publicBrowsingEnabled() {
   return state.authConfig.auth_required && state.authConfig.public_browsing_enabled === true;
 }
 async function api(path, options = {}) {
+  const { withTotal = false, ...requestOptions } = options;
   const epoch = state.authEpoch;
   const publicRequest = path.startsWith("/auth/") || path === "/login";
   if (isGuest() && !publicRequest && ((options.method || "GET").toUpperCase() !== "GET" || /^\/(?:account|follows|digest)(?:[/?]|$)/.test(path))) {
@@ -147,7 +161,7 @@ async function api(path, options = {}) {
   const response = await fetch("/api" + path, {
     credentials: "same-origin",
     cache: "no-store",
-    ...options,
+    ...requestOptions,
     headers: {
       "Content-Type": "application/json",
       "X-TrialDelta-Client": "web",
@@ -191,14 +205,17 @@ async function api(path, options = {}) {
     error.stale = true;
     throw error;
   }
-  return data;
+  return withTotal ? { items: data, total: Number(response.headers.get("X-Total-Count") ?? data.length) } : data;
 }
 function clearUserState() {
   state.authEpoch += 1;
   Object.assign(state, {
     me: null, companies: [], studies: [], follows: [], changes: [],
-    homeFeeds: { trials: null, news: null, tads: null, filings: null }, homeLoading: { trials: false, news: false, tads: false, filings: false },
-    homeErrors: { trials: "", news: "", tads: "", filings: "" }, homePages: { trials: 1, news: 1, tads: 1, filings: 1 },
+    homeFeeds: { trials: null, news: null, tads: null, filings: null, calendar: null }, homeLoading: { trials: false, news: false, tads: false, filings: false, calendar: false },
+    homeErrors: { trials: "", news: "", tads: "", filings: "", calendar: "" }, homePages: { trials: 1, news: 1, tads: 1, filings: 1 },
+    calendarUnresolvedPage: 1, calendarUnresolvedOpen: false,
+    programPage: 1, programTotal: 0, programCompany: null, programKey: "", programLoading: false, programError: "",
+    changeKey: "", changeTotal: 0,
     filingsPageSize: HOME_PAGE_SIZE,
     q: "", category: "", followed: true, changePage: 1, changeLoading: false, changeError: "", demo: false, homeTab: "trials", tab: "companies", calendarMonth: currentCalendarMonth(),
   });
@@ -217,7 +234,15 @@ function visitorIdentity() {
   return { is_guest: true, is_admin: false };
 }
 function signInButtons() {
+  if (portfolioMode()) return '<button class="primary" data-auth="login" disabled>Sign in</button><button data-auth="signup" disabled>Create account</button><p class="alpha-account-notice">Account creation is disabled during alpha development.</p>';
   return `<button class="primary" data-auth="login">Sign in</button>${state.authConfig.registration_enabled ? '<button data-auth="signup">Create account</button>' : ""}`;
+}
+function portfolioMode() {
+  return publicBrowsingEnabled() && state.authConfig.registration_enabled === false;
+}
+function snapshotNotice() {
+  const date = state.authConfig.portfolio_snapshot_date;
+  return date ? `<p class="snapshot-notice">Portfolio data snapshot: <time datetime="${esc(date)}">${esc(date)}</time>. Data is not updated live.</p>` : "";
 }
 function inviteSignIn(message = "Sign in to save companies and trials to your personal watchlist.") {
   state.returnPage = state.page;
@@ -262,20 +287,17 @@ function toast(message) {
   );
 }
 async function load() {
-  [
-    state.companies,
-    state.studies,
-    state.follows,
-    state.changes,
-  ] = await Promise.all(
-    [api("/companies"), api("/studies"), isGuest() ? Promise.resolve([]) : api("/follows"), api(`/changes?followed=${state.followed}`)],
+  [state.companies, state.follows] = await Promise.all(
+    [api("/companies"), isGuest() ? Promise.resolve([]) : api("/follows")],
   );
+  state.programKey = "";
+  state.changeKey = "";
 }
 function empty(title, copy, button = "") {
   return `<div class="empty">${icon("log")}<h3>${title}</h3><p>${copy}</p>${button}</div>`;
 }
 function heading(title, subtitle, actions = "") {
-  return `<div class="page-heading"><div><p class="eyebrow">Clinical research workspace</p><h1>${title}</h1><p class="subtitle">${subtitle}</p></div><div class="actions">${actions}</div></div>`;
+  return `<div class="page-heading"><div><p class="eyebrow">Clinical research workspace</p><h1>${title}</h1><p class="subtitle">${subtitle}</p>${snapshotNotice()}</div><div class="actions">${actions}</div></div>`;
 }
 function shell() {
   const pages = [
@@ -287,15 +309,17 @@ function shell() {
     ["account", "Account"],
   ];
   $("#app").innerHTML =
-    `<div class="shell ${isGuest() ? "visitor-shell" : ""}"><aside class="sidebar"><button class="brand brand-home" data-page="home" aria-label="TrialDelta home"><img src="/static/favicon.svg" alt=""><span>Trial<span>Delta</span></span></button><div class="workspace"><span>Research workspace</span><small>01</small></div><div class="nav-label">Research</div><nav class="nav" aria-label="Main navigation">${pages.map(([p, t]) => `<button data-page="${p}" class="${state.page === p ? "active" : ""}" ${state.page === p ? 'aria-current="page"' : ""}>${icon(p)}${t}</button>`).join("")}</nav><div class="side-bottom"><strong>Evidence over noise.</strong><br>Every change, with its source.<div class="side-rule"></div>${isGuest() ? "Browsing as a visitor" : state.me.mode === "local" ? "Local research workspace" : "Private research workspace"}<br><span>Prospective history · v0.1</span></div></aside><div class="workspace-main"><header class="topbar"><div class="breadcrumb">Workspace &nbsp;/&nbsp; <b>${pages.find((x) => x[0] === state.page)?.[1] || "Home"}</b></div><div class="top-right"><div class="search">${icon("search")}<input id="search" aria-label="Search companies, programs, news, or changes" placeholder="Search companies, programs…" value="${esc(state.q)}"></div><button class="home-logo" data-page="home" aria-label="Go to Home" title="Home"><img src="/static/favicon.svg" alt=""></button>${isGuest() ? `<div class="visitor-actions"><span class="visitor-label">Visitor</span><button class="text-button" data-auth="login">Sign in</button>${state.authConfig.registration_enabled ? '<button class="small primary" data-auth="signup">Create account</button>' : ""}</div>` : `<button class="avatar" data-page="account" title="Your account" aria-label="Your account: ${esc(state.me.display_name || state.me.email)}">${esc(accountInitials())}</button>${state.authConfig.auth_required ? '<button class="text-button top-signout" data-action="logout">Sign out</button>' : ""}`}</div></header><main id="main" class="content" tabindex="-1"></main></div></div>`;
+    `<div class="shell ${isGuest() ? "visitor-shell" : ""}"><aside class="sidebar"><button class="brand brand-home" data-page="home" aria-label="TrialDelta home"><img src="/static/favicon.svg" alt=""><span>Trial<span>Delta</span></span></button><div class="workspace"><span>Research workspace</span><small>01</small></div><div class="nav-label">Research</div><nav class="nav" aria-label="Main navigation">${pages.map(([p, t]) => `<button data-page="${p}" class="${state.page === p ? "active" : ""}" ${state.page === p ? 'aria-current="page"' : ""}>${icon(p)}${t}</button>`).join("")}</nav><div class="side-bottom"><strong>Evidence over noise.</strong><br>Every change, with its source.<div class="side-rule"></div>${isGuest() ? "Browsing as a visitor" : state.me.mode === "local" ? "Local research workspace" : "Private research workspace"}<br><span>Prospective history · v0.1</span></div></aside><div class="workspace-main"><header class="topbar"><div class="breadcrumb">Workspace &nbsp;/&nbsp; <b>${pages.find((x) => x[0] === state.page)?.[1] || "Home"}</b></div><div class="top-right"><div class="search">${icon("search")}<input id="search" aria-label="Search companies, programs, news, or changes" placeholder="Search companies, programs…" value="${esc(state.q)}"></div><button class="home-logo" data-page="home" aria-label="Go to Home" title="Home"><img src="/static/favicon.svg" alt=""></button>${isGuest() ? `<div class="visitor-actions"><span class="visitor-label">Visitor</span><div class="visitor-entry-points">${signInButtons()}</div></div>` : `<button class="avatar" data-page="account" title="Your account" aria-label="Your account: ${esc(state.me.display_name || state.me.email)}">${esc(accountInitials())}</button>${state.authConfig.auth_required ? '<button class="text-button top-signout" data-action="logout">Sign out</button>' : ""}`}</div></header><main id="main" class="content" tabindex="-1"></main></div></div>`;
   document.title = `${pages.find((x) => x[0] === state.page)?.[1] || "Home"} · TrialDelta`;
   renderPage();
-  if (state.page === "log" && !state.demo) refreshChanges();
   $("#search").addEventListener("input", (e) => {
     state.q = e.target.value;
     state.changePage = 1;
     state.homePages = { trials: 1, news: 1, tads: 1, filings: 1 };
     resetHomeFilings();
+    resetPagedHome();
+    state.programPage = 1;
+    state.programCompany = null;
     clearTimeout(window.searchTimer);
     window.searchTimer = setTimeout(renderPage, 150);
   });
@@ -328,7 +352,7 @@ function homeTrialCard(s) {
 
 function homeNewsCard(n) {
   const url = safeNewsUrl(n.url);
-  return `<article class="change-card home-news-card"><div class="card-meta"><span class="ticker">${esc(n.ticker)}</span>${n.company && n.company !== n.ticker ? `<span>${esc(n.company)}</span>` : ""}<span class="badge">Biotechnology</span></div><h3 class="change-title">${url ? `<a class="feed-title" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(n.title)}</a>` : esc(n.title)}</h3><div class="card-footer"><span class="source-meta"><span>${esc(n.source || "News")} · <time datetime="${esc(n.published_at || "")}">${fmt(n.published_at)}</time></span></span>${url ? `<a class="text-button" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Read article &nbsp;↗</a>` : ""}</div></article>`;
+  return `<article class="change-card home-news-card"><div class="card-meta"><span class="ticker">${esc(n.ticker)}</span>${n.company && n.company !== n.ticker ? `<span>${esc(n.company)}</span>` : ""}<span class="badge">Healthcare</span></div><h3 class="change-title">${url ? `<a class="feed-title" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(n.title)}</a>` : esc(n.title)}</h3><div class="card-footer"><span class="source-meta"><span>${esc(n.source || "News")} · <time datetime="${esc(n.published_at || "")}">${fmt(n.published_at)}</time></span></span>${url ? `<a class="text-button" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Read article &nbsp;↗</a>` : ""}</div></article>`;
 }
 
 // Calendar components are not timestamps. Formatting in UTC keeps the reported
@@ -406,6 +430,116 @@ function resetHomeFilings(resetPage = true) {
   state.homeLoading.filings = false;
 }
 
+function resetPagedHome(tabs = ["news", "tads", "calendar"]) {
+  for (const tab of tabs) {
+    state.homeRequests[tab] += 1;
+    state.homeFeeds[tab] = null;
+    state.homeLoading[tab] = false;
+    state.homeErrors[tab] = "";
+  }
+  if (tabs.includes("calendar")) {
+    state.calendarUnresolvedPage = 1;
+    state.calendarUnresolvedOpen = false;
+  }
+}
+
+function pagedHomeContent(tab) {
+  const name = HOME_TABS[tab].toLowerCase();
+  const controls = tab === "tads" ? `<div class="home-feed-tools"><button class="small" data-action="refresh-tads" ${state.homeLoading.tads ? "disabled" : ""}>Refresh dates</button></div>` : "";
+  if (state.demo && tab === "tads") return empty("Target action dates are not included in the demo.", "Open the live workspace to view saved target action dates.");
+  if (state.homeErrors[tab]) return controls + empty(`Unable to load ${name}`, esc(state.homeErrors[tab]), '<button data-action="retry-home">Try again</button>');
+  const feed = state.homeFeeds[tab];
+  if (feed === null) return controls + '<div class="loading" role="status">Loading the latest updates…</div>';
+  if (!feed.items.length) return controls + empty(state.q.trim() ? `No matching ${name}` : tab === "news" ? "No healthcare news yet." : `No ${name} yet.`, state.q.trim() ? "Try another company or keyword." : "Saved records will appear here when available.");
+  return `${controls}<div class="feed-date"><span>${tab === "news" ? "Latest healthcare headlines" : "Reported target action dates"}</span><span>${tab === "news" ? "Newest first" : "Latest dates first · unresolved last"}</span></div>${feed.items.map(tab === "news" ? homeNewsCard : homeTadCard).join("")}${homePagination(feed.total, state.homePages[tab], Math.max(1, Math.ceil(feed.total / HOME_PAGE_SIZE)))}`;
+}
+
+async function loadPagedHome(tab) {
+  if ((state.demo && tab === "tads") || state.homeFeeds[tab] !== null || state.homeLoading[tab] || state.homeErrors[tab]) return;
+  const request = ++state.homeRequests[tab], epoch = state.authEpoch;
+  state.homeLoading[tab] = true;
+  try {
+    const params = new URLSearchParams({ q: state.q.trim() });
+    if (tab === "news") {
+      params.set("page", state.homePages.news);
+      params.set("page_size", HOME_PAGE_SIZE);
+    } else {
+      params.set("limit", HOME_PAGE_SIZE);
+      params.set("offset", (state.homePages.tads - 1) * HOME_PAGE_SIZE);
+    }
+    let feed = await api(`/home/${tab}/page?${params}`);
+    if (request !== state.homeRequests[tab] || epoch !== state.authEpoch) return;
+    const lastPage = Math.max(1, Math.ceil(feed.total / HOME_PAGE_SIZE));
+    if (tab === "tads" && state.homePages.tads > lastPage) {
+      state.homePages.tads = lastPage;
+      params.set("offset", (lastPage - 1) * HOME_PAGE_SIZE);
+      feed = await api(`/home/tads/page?${params}`);
+      if (request !== state.homeRequests[tab] || epoch !== state.authEpoch) return;
+    }
+    state.homeFeeds[tab] = feed;
+    if (tab === "news") state.homePages.news = feed.page;
+  } catch (error) {
+    if (request !== state.homeRequests[tab] || epoch !== state.authEpoch || error.stale) return;
+    state.homeErrors[tab] = error.message;
+  } finally {
+    if (request === state.homeRequests[tab] && epoch === state.authEpoch) {
+      state.homeLoading[tab] = false;
+      if (state.page === "home" && state.homeTab === tab && $("#home-feed-panel")) $("#home-feed-panel").innerHTML = homeFeedContent();
+    }
+  }
+}
+
+async function loadCalendar() {
+  if (state.demo || state.homeLoading.calendar || state.homeErrors.calendar) return;
+  const key = `${state.calendarMonth}|${state.q.trim()}`;
+  const previous = state.homeFeeds.calendar;
+  if (previous?.key === key && previous.unresolvedPage === state.calendarUnresolvedPage) return;
+  const request = ++state.homeRequests.calendar, epoch = state.authEpoch;
+  state.homeLoading.calendar = true;
+  try {
+    const params = new URLSearchParams({ q: state.q.trim(), status: "identified", month: state.calendarMonth, limit: 500, offset: 0 });
+    const items = previous?.key === key ? previous.items : [];
+    if (previous?.key !== key) {
+      let total;
+      do {
+        params.set("offset", items.length);
+        const feed = await api(`/home/tads/page?${params}`);
+        if (request !== state.homeRequests.calendar || epoch !== state.authEpoch) return;
+        total = feed.total;
+        if (!feed.items.length && items.length < total) throw new Error("Calendar results changed while loading. Refresh dates to try again.");
+        items.push(...feed.items);
+      } while (items.length < total);
+    }
+    params.delete("month");
+    params.set("status", "unresolved");
+    params.set("limit", HOME_PAGE_SIZE);
+    params.set("offset", (state.calendarUnresolvedPage - 1) * HOME_PAGE_SIZE);
+    let unresolved = await api(`/home/tads/page?${params}`);
+    if (request !== state.homeRequests.calendar || epoch !== state.authEpoch) return;
+    const lastPage = Math.max(1, Math.ceil(unresolved.total / HOME_PAGE_SIZE));
+    if (state.calendarUnresolvedPage > lastPage) {
+      state.calendarUnresolvedPage = lastPage;
+      params.set("offset", (lastPage - 1) * HOME_PAGE_SIZE);
+      unresolved = await api(`/home/tads/page?${params}`);
+      if (request !== state.homeRequests.calendar || epoch !== state.authEpoch) return;
+    }
+    state.homeFeeds.calendar = { key, items, unresolved, unresolvedPage: state.calendarUnresolvedPage };
+  } catch (error) {
+    if (request !== state.homeRequests.calendar || epoch !== state.authEpoch || error.stale) return;
+    state.homeErrors.calendar = error.message;
+  } finally {
+    if (request === state.homeRequests.calendar && epoch === state.authEpoch) {
+      state.homeLoading.calendar = false;
+      if (state.page === "home" && state.homeTab === "calendar" && $("#home-feed-panel")) $("#home-feed-panel").innerHTML = calendarContent();
+    }
+  }
+}
+
+function unresolvedPagination(total) {
+  const page = state.calendarUnresolvedPage, pageCount = Math.max(1, Math.ceil(total / HOME_PAGE_SIZE));
+  return `<div class="feed-pagination"><p class="pagination-summary" role="status">Showing ${(page - 1) * HOME_PAGE_SIZE + 1}–${Math.min(page * HOME_PAGE_SIZE, total)} of ${total} unresolved dates</p><nav aria-label="Unresolved dates pagination"><button data-unresolved-page="${page - 1}" ${page === 1 ? "disabled" : ""}>Previous</button><span>Page ${page} of ${pageCount}</span><button data-unresolved-page="${page + 1}" ${page === pageCount ? "disabled" : ""}>Next</button></nav></div>`;
+}
+
 function filingsFeedContent() {
   if (state.demo) return empty("8-Ks are not included in the demo.", "Open the live workspace to view saved 8-K filings.");
   const controls = `<div class="home-feed-tools filing-feed-tools"><label for="home-filings-page-size">Filings per page</label><select id="home-filings-page-size">${FILING_PAGE_SIZES.map(size => `<option value="${size}"${size === state.filingsPageSize ? " selected" : ""}>${size}</option>`).join("")}</select></div>`;
@@ -458,9 +592,9 @@ function calendarEvent(row) {
 
 function calendarContent() {
   if (state.demo) return empty("Calendar is not included in the demo.", "Open the live workspace to view saved target action dates.");
-  const controls = `<div class="home-feed-tools"><button class="small" data-action="refresh-tads" ${state.homeLoading.tads || (state.homeFeeds.tads === null && !state.homeErrors.tads) ? "disabled" : ""}>Refresh dates</button></div>`;
-  if (state.homeErrors.tads) return controls + empty("Unable to load calendar", esc(state.homeErrors.tads), '<button data-action="retry-home">Try again</button>');
-  if (state.homeFeeds.tads === null) return controls + '<div class="loading" role="status">Loading the latest updates…</div>';
+  const controls = `<div class="home-feed-tools"><button class="small" data-action="refresh-tads" ${state.homeLoading.calendar ? "disabled" : ""}>Refresh dates</button></div>`;
+  if (state.homeErrors.calendar) return controls + empty("Unable to load calendar", esc(state.homeErrors.calendar), '<button data-action="retry-home">Try again</button>');
+  if (state.homeLoading.calendar || state.homeFeeds.calendar === null) return controls + '<div class="loading" role="status">Loading target action dates…</div>';
   const month = state.calendarMonth;
   const [year, monthNumber] = month.split("-").map(Number);
   const first = new Date(0);
@@ -468,11 +602,11 @@ function calendarContent() {
   const last = new Date(0);
   last.setUTCFullYear(year, monthNumber, 0);
   const monthLabel = formatTad(month, "month");
-  const rows = matchingHomeRows(state.homeFeeds.tads);
+  const rows = state.homeFeeds.calendar.items;
   const identified = rows.filter(row => row.status === "identified");
   const days = identified.filter(row => row.precision === "day" && /^\d{4}-\d{2}-\d{2}$/.test(row.tad || "") && row.tad.startsWith(month + "-"));
   const monthOnly = identified.filter(row => row.precision === "month" && row.tad === month);
-  const unresolved = rows.filter(row => row.status !== "identified");
+  const unresolved = state.homeFeeds.calendar.unresolved;
   const cells = [];
   const cellCount = Math.ceil((first.getUTCDay() + last.getUTCDate()) / 7) * 7;
   const today = new Date();
@@ -489,12 +623,13 @@ function calendarContent() {
   }
   const weeks = [];
   for (let index = 0; index < cells.length; index += 7) weeks.push(`<tr>${cells.slice(index, index + 7).join("")}</tr>`);
-  return `${controls}<div class="calendar-toolbar"><h3 id="calendar-month-label">${esc(monthLabel)}</h3><div class="calendar-navigation"><button class="small" data-calendar-month="-1" aria-label="Previous month" ${month === "0001-01" ? "disabled" : ""}>←</button><button class="small" data-calendar-month="0">This month</button><button class="small" data-calendar-month="1" aria-label="Next month" ${month === "9999-12" ? "disabled" : ""}>→</button></div></div><table class="tad-calendar" aria-labelledby="calendar-month-label"><thead><tr>${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(day => `<th scope="col">${day}</th>`).join("")}</tr></thead><tbody>${weeks.join("")}</tbody></table><p class="calendar-count subtitle" role="status">${days.length} exact ${days.length === 1 ? "date" : "dates"} · ${monthOnly.length} month-only ${monthOnly.length === 1 ? "date" : "dates"} in ${esc(monthLabel)}${state.q.trim() ? " matching your search" : ""}.</p>${!days.length && !monthOnly.length ? '<p class="subtitle">No reported target action dates for this month.</p>' : ""}<section class="calendar-month-only" aria-label="Month-only target action dates"><h3>Month reported · day not specified</h3>${monthOnly.length ? `<div class="calendar-month-events">${monthOnly.map(calendarEvent).join("")}</div>` : '<p class="subtitle">No month-only dates reported for this month.</p>'}</section>${unresolved.length ? `<details class="calendar-undated"><summary>Unresolved dates (${unresolved.length})</summary><p class="subtitle">These mentions cannot be placed on a calendar day.</p>${unresolved.map(homeTadCard).join("")}</details>` : ""}`;
+  return `${controls}<div class="calendar-toolbar"><h3 id="calendar-month-label">${esc(monthLabel)}</h3><div class="calendar-navigation"><button class="small" data-calendar-month="-1" aria-label="Previous month" ${month === "0001-01" ? "disabled" : ""}>←</button><button class="small" data-calendar-month="0">This month</button><button class="small" data-calendar-month="1" aria-label="Next month" ${month === "9999-12" ? "disabled" : ""}>→</button></div></div><table class="tad-calendar" aria-labelledby="calendar-month-label"><thead><tr>${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(day => `<th scope="col">${day}</th>`).join("")}</tr></thead><tbody>${weeks.join("")}</tbody></table><p class="calendar-count subtitle" role="status">${days.length} exact ${days.length === 1 ? "date" : "dates"} · ${monthOnly.length} month-only ${monthOnly.length === 1 ? "date" : "dates"} in ${esc(monthLabel)}${state.q.trim() ? " matching your search" : ""}.</p>${!days.length && !monthOnly.length ? '<p class="subtitle">No reported target action dates for this month.</p>' : ""}<section class="calendar-month-only" aria-label="Month-only target action dates"><h3>Month reported · day not specified</h3>${monthOnly.length ? `<div class="calendar-month-events">${monthOnly.map(calendarEvent).join("")}</div>` : '<p class="subtitle">No month-only dates reported for this month.</p>'}</section>${unresolved.total ? `<details class="calendar-undated" ${state.calendarUnresolvedOpen ? "open" : ""}><summary>Unresolved dates (${unresolved.total})</summary><p class="subtitle">These mentions cannot be placed on a calendar day.</p>${unresolved.items.map(homeTadCard).join("")}${unresolvedPagination(unresolved.total)}</details>` : ""}`;
 }
 
 function homeFeedContent() {
   if (state.homeTab === "calendar") return calendarContent();
   if (state.homeTab === "filings") return filingsFeedContent();
+  if (["news", "tads"].includes(state.homeTab)) return pagedHomeContent(state.homeTab);
   const tab = state.homeTab;
   const name = HOME_TABS[tab].toLowerCase();
   if (state.demo && tab === "tads")
@@ -508,10 +643,10 @@ function homeFeedContent() {
   const rows = matchingHomeRows(state.homeFeeds[tab]);
   if (!rows.length)
     return controls + empty(
-      query ? `No matching ${name}` : tab === "trials" ? "New trials will appear here." : tab === "news" ? "No biotech news yet." : "No target action dates yet.",
+      query ? `No matching ${name}` : tab === "trials" ? "New trials will appear here." : tab === "news" ? "No healthcare news yet." : "No target action dates yet.",
       query ? "Try another company, program, or keyword." : tab === "trials"
         ? "Explore the companies in your workspace while you wait for new clinical programs."
-        : tab === "news" ? "The latest available headlines for biotechnology companies will appear here."
+        : tab === "news" ? "The latest available headlines for healthcare companies will appear here."
         : "Saved target action dates, manual entries, and unresolved date mentions from SEC filings will appear here.",
       query ? "" : '<button data-page="coverage">Explore companies &nbsp;→</button>',
     );
@@ -521,13 +656,15 @@ function homeFeedContent() {
   const first = (page - 1) * HOME_PAGE_SIZE;
   const pageRows = rows.slice(first, first + HOME_PAGE_SIZE);
   const renderer = { trials: homeTrialCard, news: homeNewsCard, tads: homeTadCard }[tab];
-  return `${controls}<div class="feed-date"><span>${tab === "trials" ? "Recently added trials" : tab === "news" ? "Latest biotech headlines" : "Reported target action dates"}</span><span>${tab === "tads" ? "Latest dates first · unresolved last" : "Newest first"}</span></div>${pageRows.map(renderer).join("")}${homePagination(rows.length, page, pageCount)}`;
+  return `${controls}<div class="feed-date"><span>${tab === "trials" ? "Recently added trials" : tab === "news" ? "Latest healthcare headlines" : "Reported target action dates"}</span><span>${tab === "tads" ? "Latest dates first · unresolved last" : "Newest first"}</span></div>${pageRows.map(renderer).join("")}${homePagination(rows.length, page, pageCount)}`;
 }
 
 async function loadHomeFeed() {
   const epoch = state.authEpoch;
   const tab = homeFeedKey();
   if (tab === "filings") return loadHomeFilings();
+  if (tab === "calendar") return loadCalendar();
+  if (["news", "tads"].includes(tab)) return loadPagedHome(tab);
   if ((state.demo && tab === "tads") || state.homeFeeds[tab] !== null || state.homeLoading[tab] || state.homeErrors[tab]) return;
   state.homeLoading[tab] = true;
   try {
@@ -548,12 +685,12 @@ async function loadHomeFeed() {
 function homePage() {
   const notes = {
     trials: "Clinical programs, ordered by when they were first added to your workspace.",
-    news: "The latest published headlines for biotechnology companies.",
+    news: "The latest published headlines for healthcare companies.",
     tads: "Dates reported in SEC filings and entered manually, including month-only dates and unresolved mentions. A reported date may have changed in a later filing.",
     filings: "Saved 8-K filings, ordered by filing date with the newest first. Search by ticker, company, or accession number.",
     calendar: "Reported target action dates by month. Month-only dates are listed separately; a reported date may have changed in a later filing.",
   };
-  return `${heading("Home.", "The latest trials, biotechnology news, SEC filings, and reported target action dates, in one place.")}<div class="columns"><section class="home-feed"><div class="section-head"><h2>Latest updates</h2></div><div class="filters home-tabs" role="tablist" aria-label="Home feeds">${Object.entries(HOME_TABS).map(([tab, title]) => `<button id="home-tab-${tab}" role="tab" data-home-tab="${tab}" aria-controls="home-feed-panel" aria-selected="${state.homeTab === tab}" tabindex="${state.homeTab === tab ? 0 : -1}" class="${state.homeTab === tab ? "selected" : ""}">${title}</button>`).join("")}</div><p class="subtitle home-feed-note">${notes[state.homeTab]}</p><div id="home-feed-panel" role="tabpanel" aria-labelledby="home-tab-${state.homeTab}" tabindex="0">${homeFeedContent()}</div></section>${researchRail()}</div>`;
+  return `${heading("Home.", "The latest trials, healthcare news, SEC filings, and reported target action dates, in one place.")}<div class="columns"><section class="home-feed"><div class="section-head"><h2>Latest updates</h2></div><div class="filters home-tabs" role="tablist" aria-label="Home feeds">${Object.entries(HOME_TABS).map(([tab, title]) => `<button id="home-tab-${tab}" role="tab" data-home-tab="${tab}" aria-controls="home-feed-panel" aria-selected="${state.homeTab === tab}" tabindex="${state.homeTab === tab ? 0 : -1}" class="${state.homeTab === tab ? "selected" : ""}">${title}</button>`).join("")}</div><p class="subtitle home-feed-note">${notes[state.homeTab]}</p><div id="home-feed-panel" role="tabpanel" aria-labelledby="home-tab-${state.homeTab}" tabindex="0">${homeFeedContent()}</div></section>${researchRail()}</div>`;
 }
 
 
@@ -562,28 +699,43 @@ async function refreshChanges() {
   const epoch = state.authEpoch;
   state.changeLoading = true;
   state.changeError = "";
-  if (state.page === "log" && !state.demo) renderPage();
+  state.changeKey = changeQueryKey();
+  if (state.page === "log" && !state.demo && $("#change-feed-panel")) $("#change-feed-panel").innerHTML = changeFeedContent();
   try {
-    const changes = await api(`/changes?followed=${state.followed}`);
+    const params = new URLSearchParams({ followed: state.followed, category: state.category, q: state.q.trim(), limit: CHANGE_PAGE_SIZE, offset: (state.changePage - 1) * CHANGE_PAGE_SIZE });
+    let changes = await api(`/changes?${params}`, { withTotal: true });
     if (request !== state.changeRequest || epoch !== state.authEpoch) return;
-    state.changes = changes;
+    const lastPage = Math.max(1, Math.ceil(changes.total / CHANGE_PAGE_SIZE));
+    if (state.changePage > lastPage) {
+      state.changePage = lastPage;
+      params.set("offset", (lastPage - 1) * CHANGE_PAGE_SIZE);
+      changes = await api(`/changes?${params}`, { withTotal: true });
+      if (request !== state.changeRequest || epoch !== state.authEpoch) return;
+      state.changeKey = changeQueryKey();
+    }
+    state.changes = changes.items;
+    state.changeTotal = changes.total;
   } catch (error) {
     if (request !== state.changeRequest || epoch !== state.authEpoch || error.stale) return;
     state.changeError = error.message;
   } finally {
     if (request === state.changeRequest && epoch === state.authEpoch) {
       state.changeLoading = false;
-      if (state.page === "log" && !state.demo && state.me) renderPage();
+      if (state.page === "log" && !state.demo && state.me && $("#change-feed-panel")) $("#change-feed-panel").innerHTML = changeFeedContent();
     }
   }
+}
+
+function changeQueryKey() {
+  return `${state.followed}|${state.category}|${state.q.trim()}|${state.changePage}`;
 }
 
 function changePagination(total, page, pageCount) {
   if (pageCount <= 1) return "";
   const links = [];
   let previous = 0;
-  for (let number = 1; number <= pageCount; number++) {
-    if (number !== 1 && number !== pageCount && Math.abs(number - page) > 1) continue;
+  const pages = [...new Set([1, page - 1, page, page + 1, pageCount])].filter(number => number >= 1 && number <= pageCount).sort((a, b) => a - b);
+  for (const number of pages) {
     if (previous && number - previous > 1)
       links.push('<span class="pagination-gap" aria-hidden="true">…</span>');
     links.push(`<button data-change-page="${number}" aria-label="Go to page ${number}" ${number === page ? 'aria-current="page"' : ""}>${number}</button>`);
@@ -598,11 +750,11 @@ function changeFeedContent() {
   if (!state.demo && state.changeError)
     return empty("Unable to load changes", esc(state.changeError), '<button data-action="retry-changes">Try again</button>');
   const query = state.q.trim().toLowerCase();
-  const changes = (state.demo ? demo : state.changes)
+  const changes = state.demo ? demo
     .filter((c) => !state.category || c.category === state.category)
     .filter((c) => !query || [c.company, c.ticker, c.study_id, c.study_title, c.drug, c.title, c.before_value, c.after_value, label(c.category)]
       .some((value) => String(value || "").toLowerCase().includes(query)))
-    .slice().sort((a, b) => Date.parse(b.detected_at) - Date.parse(a.detected_at) || Number(b.id) - Number(a.id));
+    .slice().sort((a, b) => Date.parse(b.detected_at) - Date.parse(a.detected_at) || Number(b.id) - Number(a.id)) : state.changes;
   if (!changes.length) {
     state.changePage = 1;
     const noFollows = !state.demo && state.followed && !state.follows.length;
@@ -613,11 +765,12 @@ function changeFeedContent() {
       : "New registry changes will appear here automatically as they are collected. Each update includes the previous and current source records.";
     return empty(title, copy, '<button data-page="coverage">Explore companies and trials &nbsp;→</button>');
   }
-  const pageCount = Math.ceil(changes.length / CHANGE_PAGE_SIZE);
+  const total = state.demo ? changes.length : state.changeTotal;
+  const pageCount = Math.max(1, Math.ceil(total / CHANGE_PAGE_SIZE));
   const page = Math.min(Math.max(state.changePage, 1), pageCount);
   state.changePage = page;
-  const rows = changes.slice((page - 1) * CHANGE_PAGE_SIZE, page * CHANGE_PAGE_SIZE);
-  return `<div class="feed-date"><span>${state.demo ? "Sample research brief" : "Newest first"}</span><span>${state.demo ? "Fictional examples" : state.followed ? "Your watchlist" : "All tracked changes"}</span></div>${rows.map(card).join("")}${changePagination(changes.length, page, pageCount)}`;
+  const rows = state.demo ? changes.slice((page - 1) * CHANGE_PAGE_SIZE, page * CHANGE_PAGE_SIZE) : changes;
+  return `<div class="feed-date"><span>${state.demo ? "Sample research brief" : "Newest first"}</span><span>${state.demo ? "Fictional examples" : state.followed ? "Your watchlist" : "All tracked changes"}</span></div>${rows.map(card).join("")}${changePagination(total, page, pageCount)}`;
 }
 
 function logPage() {
@@ -658,9 +811,53 @@ function coverageNotice(company) {
   return badge ? `<div class="notice">${esc(company.name || company.company || company.ticker)} ${badge}<br>Automatic collection is inactive. Saved trials and source history remain available.</div>` : "";
 }
 
+function programQueryKey() {
+  return `${state.programCompany || ""}|${state.programCompany ? "" : state.q.trim()}|${state.programPage}`;
+}
+
+async function loadPrograms() {
+  const key = programQueryKey();
+  if (state.programKey === key) return;
+  state.programKey = key;
+  const request = ++state.programRequest, epoch = state.authEpoch;
+  state.programLoading = true;
+  state.programError = "";
+  if (state.page === "coverage" && state.tab === "programs" && $("#main")) $("#main").innerHTML = coveragePage();
+  try {
+    const params = new URLSearchParams({ limit: PROGRAM_PAGE_SIZE, offset: (state.programPage - 1) * PROGRAM_PAGE_SIZE });
+    if (state.programCompany) params.set("company_id", state.programCompany);
+    else params.set("q", state.q.trim());
+    let feed = await api(`/studies?${params}`, { withTotal: true });
+    if (request !== state.programRequest || epoch !== state.authEpoch) return;
+    const lastPage = Math.max(1, Math.ceil(feed.total / PROGRAM_PAGE_SIZE));
+    if (state.programPage > lastPage) {
+      state.programPage = lastPage;
+      params.set("offset", (lastPage - 1) * PROGRAM_PAGE_SIZE);
+      feed = await api(`/studies?${params}`, { withTotal: true });
+      if (request !== state.programRequest || epoch !== state.authEpoch) return;
+      state.programKey = programQueryKey();
+    }
+    state.studies = feed.items;
+    state.programTotal = feed.total;
+  } catch (error) {
+    if (request !== state.programRequest || epoch !== state.authEpoch || error.stale) return;
+    state.programError = error.message;
+  } finally {
+    if (request === state.programRequest && epoch === state.authEpoch) {
+      state.programLoading = false;
+      if (state.page === "coverage" && state.tab === "programs" && $("#main")) $("#main").innerHTML = coveragePage();
+    }
+  }
+}
+
+function programPagination() {
+  const total = state.programTotal, page = state.programPage, pageCount = Math.max(1, Math.ceil(total / PROGRAM_PAGE_SIZE));
+  return `<div class="feed-pagination"><p class="pagination-summary" role="status">Showing ${total ? (page - 1) * PROGRAM_PAGE_SIZE + 1 : 0}–${Math.min(page * PROGRAM_PAGE_SIZE, total)} of ${total} clinical programs</p><nav aria-label="Clinical programs pagination"><button data-program-page="${page - 1}" ${page === 1 ? "disabled" : ""}>Previous</button><span>Page ${page} of ${pageCount}</span><button data-program-page="${page + 1}" ${page === pageCount ? "disabled" : ""}>Next</button></nav></div>`;
+}
+
 function coveragePage() {
   let rows = state.tab === "companies" ? state.companies : state.studies;
-  if (state.q)
+  if (state.q && state.tab === "companies")
     rows = rows.filter((r) =>
       (state.tab === "companies" ? `${r.name} ${r.ticker}` : JSON.stringify(r)).toLowerCase().includes(state.q.toLowerCase()),
     );
@@ -668,7 +865,7 @@ function coveragePage() {
     state.follows.filter((f) => !["company", "program"].includes(f.kind)).length
       ? `<div class="pill-list">${state.follows.filter((f) => !["company", "program"].includes(f.kind)).map((f) => `<span class="pill">${esc(f.kind)}: ${esc(f.value)}<button data-unfollow="${f.id}" aria-label="Unfollow ${esc(f.value)}">×</button></span>`).join("")}</div><br>`
       : ""
-  }${state.tab === "programs" ? coverageNotice(state.companies.find((c) => c.ticker.toLowerCase() === state.q.trim().toLowerCase())) : ""}${rows.length ? `<div class="table-wrap"><table><thead><tr>${state.tab === "companies" ? "<th>Company</th><th>Trials captured</th><th>Programs</th><th>Watchlist</th>" : "<th>Clinical program</th><th>Status</th><th>Primary completion</th><th>Watchlist</th>"}</tr></thead><tbody>${rows.map((r) => state.tab === "companies" ? `<tr><td><button class="name-button" data-company="${r.id}">${esc(r.name)}</button><small>${esc(r.ticker)} ${coverageBadge(r)}</small></td><td>${esc(r.study_count ?? 0)}</td><td><button class="text-button" data-company="${r.id}">Explore programs ↗</button></td><td><button class="small ${r.followed ? "" : "primary"}" data-follow-company="${r.id}">${r.followed ? "Following ✓" : "+ Follow"}</button></td></tr>` : `<tr><td class="table-title"><button class="name-button" data-study="${r.id}">${esc(r.title)}</button><small>${esc(r.ticker)} · ${esc(r.id)} · ${esc(phaseLabel(r.phase))} ${coverageBadge(r)}</small></td><td><span class="badge">${esc(r.status.replaceAll("_", " ").toLowerCase())}</span></td><td>${esc(r.primary_completion || "Not reported")}<small>Registry milestone · not readout</small></td><td><button class="small" data-follow-study="${r.id}">${state.follows.some((f) => f.kind === "program" && f.value === r.id) ? "Following ✓" : "+ Follow"}</button></td></tr>`).join("")}</tbody></table></div>` : empty(state.q ? "No matching companies or programs" : "More research to explore soon.", state.q ? "Try a different company, drug, or clinical program in your search." : "Company profiles and clinical programs will appear here when available. You can still follow a research theme.")}<p class="footer-note">Coverage tags reflect the latest market coverage refresh. Delisted and out-of-sector companies retain their saved trial history. Clinical programs are associated with their lead sponsor.</p>`;
+  }${state.tab === "programs" ? coverageNotice(state.companies.find((c) => c.id === state.programCompany || c.ticker.toLowerCase() === state.q.trim().toLowerCase())) : ""}${state.tab === "programs" && state.programCompany ? `<p class="program-scope">${esc(state.companies.find(c => c.id === state.programCompany)?.name || "Selected company")} · ${state.programTotal} clinical programs <button class="text-button" data-action="all-programs">Explore all programs</button></p>` : ""}${state.tab === "programs" && state.programLoading ? '<div class="loading" role="status">Loading clinical programs…</div>' : state.tab === "programs" && state.programError ? empty("Unable to load clinical programs", esc(state.programError), '<button data-action="retry-programs">Try again</button>') : rows.length ? `<div class="table-wrap"><table><thead><tr>${state.tab === "companies" ? "<th>Company</th><th>Trials captured</th><th>Programs</th><th>Watchlist</th>" : "<th>Clinical program</th><th>Status</th><th>Primary completion</th><th>Watchlist</th>"}</tr></thead><tbody>${rows.map((r) => state.tab === "companies" ? `<tr><td><button class="name-button" data-company="${r.id}">${esc(r.name)}</button><small>${esc(r.ticker)} ${coverageBadge(r)}</small></td><td>${esc(r.study_count ?? 0)}</td><td><button class="text-button" data-company="${r.id}">Explore programs ↗</button></td><td><button class="small ${r.followed ? "" : "primary"}" data-follow-company="${r.id}">${r.followed ? "Following ✓" : "+ Follow"}</button></td></tr>` : `<tr><td class="table-title"><button class="name-button" data-study="${r.id}">${esc(r.title)}</button><small>${esc(r.ticker)} · ${esc(r.id)} · ${esc(phaseLabel(r.phase))} ${coverageBadge(r)}</small></td><td><span class="badge">${esc(r.status.replaceAll("_", " ").toLowerCase())}</span></td><td>${esc(r.primary_completion || "Not reported")}<small>Registry milestone · not readout</small></td><td><button class="small" data-follow-study="${r.id}">${state.follows.some((f) => f.kind === "program" && f.value === r.id) ? "Following ✓" : "+ Follow"}</button></td></tr>`).join("")}</tbody></table></div>` : empty(state.q ? "No matching companies or programs" : "More research to explore soon.", state.q ? "Try a different company, drug, or clinical program in your search." : "Company profiles and clinical programs will appear here when available. You can still follow a research theme.")}${state.tab === "programs" && !state.programLoading && !state.programError ? programPagination() : ""}<p class="footer-note">Coverage tags reflect the latest market coverage refresh. Delisted and out-of-sector companies retain their saved trial history. Clinical programs are associated with their lead sponsor.</p>`;
 }
 
 async function renderPage() {
@@ -682,8 +879,13 @@ async function renderPage() {
   if (page === "home") {
     main.innerHTML = homePage();
     await loadHomeFeed();
-  } else if (page === "log") main.innerHTML = logPage();
-  else if (page === "coverage") main.innerHTML = coveragePage();
+  } else if (page === "log") {
+    main.innerHTML = logPage();
+    if (!state.demo && state.changeKey !== changeQueryKey()) await refreshChanges();
+  } else if (page === "coverage") {
+    main.innerHTML = coveragePage();
+    if (state.tab === "programs") await loadPrograms();
+  }
   else {
     main.innerHTML = '<div class="loading">Loading…</div>';
     try {
@@ -748,16 +950,33 @@ function evidenceForm() {
     "Record a source statement",
     `<p class="subtitle">Preserve the exact excerpt and the claim it supports. A reviewer must approve it before it changes the timeline.</p><br><form id="evidence-form"><div class="form-grid"><div class="field"><label for="company">Company</label><select id="company" name="company_id" required>${state.companies.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select></div><div class="field"><label for="study">Trial (optional)</label><select id="study" name="study_id"><option value="">Company-level statement</option></select></div><div class="field"><label for="source-type">Source type</label><select id="source-type" name="source_type"><option value="presentation">Company presentation</option><option value="press_release">Press release</option><option value="filing">Regulatory filing</option><option value="publication">Publication</option></select></div><div class="field"><label for="publication">Source publication date</label><input id="publication" type="date" name="published_at" required max="${new Date().toISOString().slice(0, 10)}"></div><div class="field full"><label for="title">Source title and page reference</label><input id="title" name="title" required minlength="3" maxlength="500" placeholder="Q2 corporate presentation, page 14"></div><div class="field full"><label for="url">Original source URL</label><input id="url" type="url" name="url" required placeholder="https://investors.company.com/…"></div><div class="field full"><label for="quote">Exact supporting excerpt</label><textarea id="quote" name="quote" required minlength="10" maxlength="20000" placeholder="Paste the original wording, including timing qualifiers."></textarea></div><div class="field"><label for="category">Change category</label><select id="category" name="category">${["timeline", "development_status", "trial_design", "enrollment", "partnership", "milestone", "results"].map((c) => `<option value="${c}">${label(c)}</option>`).join("")}</select></div><div class="field"><label for="value">Supported value / timing window</label><input id="value" name="value" required maxlength="1000" placeholder="e.g. H2 2026"><small>Use H1/H2, Q1–Q4, YYYY-MM, or original uncertain wording.</small></div><div class="field full"><label for="reason">Reason stated by the source (if any)</label><input id="reason" name="reason" maxlength="2000"></div></div><label class="check-label"><input type="checkbox" name="reason_checked">I checked the source for an explanation of the change.</label><p class="error" id="form-error"></p><button class="primary" type="submit">Submit for review</button></form>`,
   );
-  const update = () => {
-    $("#study").innerHTML =
-      '<option value="">Company-level statement</option>' +
-      state.studies
-        .filter((s) => String(s.company_id) === $("#company").value)
-        .map(
-          (s) =>
-            `<option value="${s.id}">${esc(s.id)} · ${esc(s.title.slice(0, 80))}</option>`,
-        )
-        .join("");
+  const form = $("#evidence-form");
+  let request = 0;
+  const update = async () => {
+    const current = ++request, companyId = $("#company", form).value;
+    const selector = $("#study", form);
+    selector.innerHTML = '<option value="">Loading company trials…</option>';
+    selector.disabled = true;
+    $("#form-error", form).textContent = "";
+    try {
+      const rows = [];
+      let total;
+      do {
+        const params = new URLSearchParams({ company_id: companyId, limit: 500, offset: rows.length });
+        const page = await api(`/studies?${params}`, { withTotal: true });
+        if (current !== request || !form.isConnected) return;
+        total = page.total;
+        if (!page.items.length && rows.length < total) throw new Error("Company trials changed while loading. Select the company again to retry.");
+        rows.push(...page.items);
+      } while (rows.length < total);
+      selector.innerHTML = '<option value="">Company-level statement</option>' + rows.map(s => `<option value="${esc(s.id)}">${esc(s.id)} · ${esc(s.title.slice(0, 80))}</option>`).join("");
+    } catch (error) {
+      if (current !== request || !form.isConnected || error.stale) return;
+      selector.innerHTML = '<option value="">Company-level statement</option>';
+      $("#form-error", form).textContent = error.message;
+    } finally {
+      if (current === request && form.isConnected) selector.disabled = false;
+    }
   };
   $("#company").onchange = update;
   update();
@@ -767,26 +986,24 @@ function followForm() {
     "Follow a research theme",
     `<form id="follow-form"><div class="field"><label for="follow-kind">Follow type</label><select id="follow-kind" name="kind"><option value="drug">Drug / intervention</option><option value="target">Target</option><option value="indication">Indication</option></select></div><div class="field"><label for="follow-value">Name</label><input id="follow-value" name="value" list="theme-options" required maxlength="200"><datalist id="theme-options"></datalist><small>Names match exact registry terms or curated target tags, ignoring case.</small></div><p class="error" id="form-error"></p><button class="primary">Add to watchlist</button></form>`,
   );
-  const update = () => {
+  const form = $("#follow-form");
+  let request = 0, timer;
+  const update = async () => {
+    const current = ++request;
     const kind = $("#follow-kind").value;
-    const values = [
-      ...new Set(
-        state.studies.flatMap((s) =>
-          kind === "drug"
-            ? s.drug.split(";").map((v) => v.trim())
-            : kind === "target"
-              ? s.targets
-              : s.conditions,
-        ),
-      ),
-    ]
-      .filter(Boolean)
-      .sort();
-    $("#theme-options").innerHTML = values
-      .map((v) => `<option value="${esc(v)}">`)
-      .join("");
+    const params = new URLSearchParams({ kind, q: $("#follow-value", form).value.trim(), limit: 50 });
+    try {
+      const values = await api(`/themes?${params}`);
+      if (current !== request || !form.isConnected) return;
+      $("#theme-options", form).innerHTML = values.map(v => `<option value="${esc(v)}">`).join("");
+      $("#form-error", form).textContent = "";
+    } catch (error) {
+      if (current !== request || !form.isConnected || error.stale) return;
+      $("#form-error", form).textContent = error.message;
+    }
   };
   $("#follow-kind").onchange = update;
+  $("#follow-value", form).addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(update, 200); });
   update();
 }
 function digestPage(d) {
@@ -794,7 +1011,7 @@ function digestPage(d) {
 }
 
 function settingsPage() {
-  return `${heading("Workspace settings.", "Make this workspace part of your research routine.")}<div class="settings-grid"><section class="settings-card"><h2>Your research</h2><p>Follow the companies, programs, and themes that matter to you. Your watchlist is personal to your account.</p><button data-page="coverage">Manage your watchlist</button></section><section class="settings-card"><h2>Account & preferences</h2><p>Manage your profile, email preferences, and account security in one place.</p><button data-page="account">Open your account</button></section><section class="settings-card"><h2>Reading the evidence</h2><ul><li>Registry changes appear automatically with their previous and current source records.</li><li>Source excerpts and earlier statements stay linked to the change.</li><li>Registry dates retain their original precision.</li><li>A trial’s primary completion and a company’s expected readout are different milestones.</li></ul><button data-action="evidence">Add evidence for review</button></section></div>`;
+  return `${heading("Workspace settings.", "Make this workspace part of your research routine.")}<div class="settings-grid"><section class="settings-card"><h2>Your research</h2><p>Follow the companies, programs, and themes that matter to you. Your watchlist is personal to your account.</p><button data-page="coverage">Manage your watchlist</button></section><section class="settings-card account-settings-card"><h2>Account & preferences</h2><p>Manage your profile, email preferences, and account security in one place.</p><button data-page="account">Open your account</button></section><section class="settings-card"><h2>Reading the evidence</h2><ul><li>Registry changes appear automatically with their previous and current source records.</li><li>Source excerpts and earlier statements stay linked to the change.</li><li>Registry dates retain their original precision.</li><li>A trial’s primary completion and a company’s expected readout are different milestones.</li></ul><button data-action="evidence">Add evidence for review</button></section></div>`;
 }
 function formFeedback() {
   return '<p class="error form-error" role="alert" tabindex="-1"></p><p class="form-status" role="status" aria-live="polite"></p>';
@@ -845,6 +1062,23 @@ document.addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b || b.disabled) return;
   try {
+    if (b.dataset.programPage) {
+      const page = Number(b.dataset.programPage);
+      if (!Number.isInteger(page) || page < 1) return;
+      state.programPage = page;
+      await renderPage();
+      $("#main")?.focus({ preventScroll: true });
+      return;
+    }
+    if (b.dataset.unresolvedPage) {
+      const page = Number(b.dataset.unresolvedPage);
+      if (!Number.isInteger(page) || page < 1) return;
+      state.calendarUnresolvedPage = page;
+      state.calendarUnresolvedOpen = true;
+      await renderPage();
+      $(".calendar-undated summary")?.focus({ preventScroll: true });
+      return;
+    }
     if (b.dataset.auth) {
       if ($("#app .shell")) state.returnPage = state.page;
       $("#detail").close();
@@ -863,6 +1097,9 @@ document.addEventListener("click", async (e) => {
       state.changePage = 1;
       state.homePages = { trials: 1, news: 1, tads: 1, filings: 1 };
       resetHomeFilings();
+      resetPagedHome();
+      state.programPage = 1;
+      state.programCompany = null;
       state.demo = false;
       shell();
       $("#main").focus({ preventScroll: true });
@@ -873,7 +1110,8 @@ document.addEventListener("click", async (e) => {
       if (!Number.isInteger(page) || page < 1 || b.disabled) return;
       state.changePage = page;
       const panel = $("#change-feed-panel");
-      panel.innerHTML = changeFeedContent();
+      if (state.demo) panel.innerHTML = changeFeedContent();
+      else await refreshChanges();
       panel.focus({ preventScroll: true });
       panel.scrollIntoView({ block: "start" });
       return;
@@ -883,11 +1121,12 @@ document.addEventListener("click", async (e) => {
       if (!Number.isInteger(page) || page < 1 || b.disabled) return;
       state.homePages[state.homeTab] = page;
       if (state.homeTab === "filings") resetHomeFilings(false);
+      if (["news", "tads"].includes(state.homeTab)) resetPagedHome([state.homeTab]);
       const panel = $("#home-feed-panel");
       panel.innerHTML = homeFeedContent();
       panel.focus({ preventScroll: true });
       panel.scrollIntoView({ block: "start" });
-      if (state.homeTab === "filings") await loadHomeFeed();
+      if (["filings", "news", "tads"].includes(state.homeTab)) await loadHomeFeed();
       return;
     }
     if (b.dataset.calendarMonth !== undefined) {
@@ -902,12 +1141,13 @@ document.addEventListener("click", async (e) => {
         if (target.getUTCFullYear() < 1 || target.getUTCFullYear() > 9999) return;
         state.calendarMonth = `${String(target.getUTCFullYear()).padStart(4, "0")}-${String(target.getUTCMonth() + 1).padStart(2, "0")}`;
       }
-      $("#home-feed-panel").innerHTML = calendarContent();
-      $(`[data-calendar-month="${offset}"]`).focus({ preventScroll: true });
+      resetPagedHome(["calendar"]);
+      await renderPage();
+      $(`[data-calendar-month="${offset}"]`)?.focus({ preventScroll: true });
       return;
     }
     if (b.dataset.calendarTad) {
-      const row = (state.homeFeeds.tads || []).find(row => String(row.id) === b.dataset.calendarTad);
+      const row = (state.homeFeeds.calendar?.items || []).find(row => String(row.id) === b.dataset.calendarTad);
       if (row) dialog("Reported target action date", homeTadCard(row));
       return;
     }
@@ -947,6 +1187,8 @@ document.addEventListener("click", async (e) => {
       state.page = "coverage";
       setRoute("coverage");
       state.tab = "programs";
+      state.programCompany = Number(b.dataset.company);
+      state.programPage = 1;
       state.q = state.companies.find(
         (c) => c.id === Number(b.dataset.company),
       ).ticker;
@@ -983,9 +1225,8 @@ document.addEventListener("click", async (e) => {
         await boot();
         break;
       case "refresh-tads":
-        if (!["tads", "calendar"].includes(state.homeTab) || state.homeLoading.tads || state.demo) return;
-        state.homeFeeds.tads = null;
-        state.homeErrors.tads = "";
+        if (!["tads", "calendar"].includes(state.homeTab) || state.homeLoading[state.homeTab] || state.demo) return;
+        resetPagedHome(["tads", "calendar"]);
         state.homePages.tads = 1;
         renderPage();
         break;
@@ -1010,6 +1251,16 @@ document.addEventListener("click", async (e) => {
         break;
       case "retry-changes":
         await refreshChanges();
+        break;
+      case "retry-programs":
+        state.programKey = "";
+        await renderPage();
+        break;
+      case "all-programs":
+        state.programCompany = null;
+        state.programPage = 1;
+        state.q = "";
+        shell();
         break;
       case "programs":
         state.page = "coverage";

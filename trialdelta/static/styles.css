@@ -1,5 +1,14 @@
 @import url("/static/base.css");
 
+/* Visitor entry points stay visible; authenticated administrator controls remain usable. */
+.alpha-account-notice { color: #b42318; font-size: .75rem; line-height: 1.4; margin: 5px 0 0; flex-basis: 100%; }
+.visitor-entry-points { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 285px; }
+.visitor-entry-points button { padding: 6px 10px; font-size: .75rem; }
+button:disabled { cursor: not-allowed; opacity: .6; }
+.snapshot-notice { color: var(--muted); font-size: .8125rem; margin: 8px 0 0; }
+.program-scope { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0; }
+@media (max-width: 700px) { .visitor-actions { flex-wrap: wrap; } .visitor-entry-points { max-width: 210px; } }
+
 .coverage-inactive {
   margin-left: 8px;
   background: #f7ebdf;

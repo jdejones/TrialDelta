@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, or_, true
 from sqlalchemy.exc import SQLAlchemyError
 
 from .db import (
@@ -43,9 +43,11 @@ from .services import (
     change_dict,
     review_item as review_saved_item,
     reconciliation,
+    public_record,
+    published_changes_page,
 )
 
-from .home import FILING_PAGE_SIZES, recent_filings, recent_news, recent_trials
+from .home import FILING_PAGE_SIZES, recent_filings, recent_news, recent_trials, paged_news
 from .tad import list_target_action_dates
 
 ROOT = Path(__file__).parent
@@ -148,7 +150,7 @@ def companies(user=Depends(browsing_user), db=Depends(get_db)):
     )
     return [
         {
-            **{k: v for k, v in as_dict(c).items() if k not in ("last_checked", "last_error")},
+            **{k: v for k, v in public_record(as_dict(c)).items() if k not in ("last_checked", "last_error")},
             "followed": str(c.id) in follows,
             "study_count": totals.get(c.id, 0),
             "coverage_label": _coverage_label(c.coverage_status),
@@ -175,11 +177,45 @@ def home_news(user=Depends(browsing_user), db=Depends(get_db)):
         raise HTTPException(503, "Biotechnology news is temporarily unavailable.") from None
 
 
+@app.get("/api/home/news/page")
+def home_news_page(
+    page: int = Query(default=1, ge=1, le=2147483647),
+    page_size: int = Query(default=10, ge=1, le=100),
+    q: str = Query(default="", max_length=200),
+    user=Depends(browsing_user), db=Depends(get_db),
+):
+    if page_size not in FILING_PAGE_SIZES:
+        raise HTTPException(422, "Select 10, 25, 50, or 100 articles per page.")
+    try:
+        return paged_news(db, page=page, page_size=page_size, q=q)
+    except SQLAlchemyError:
+        raise HTTPException(503, "Healthcare news is temporarily unavailable.") from None
+
+
 @app.get("/api/home/tads")
 def home_tads(user=Depends(browsing_user), db=Depends(get_db)):
     """Read saved results only; source imports belong to the administrator."""
     try:
-        return list_target_action_dates(db, limit=500)["items"]
+        return [public_record(item) for item in list_target_action_dates(db, limit=500)["items"]]
+    except SQLAlchemyError:
+        raise HTTPException(503, "Target action dates are temporarily unavailable.") from None
+
+
+@app.get("/api/home/tads/page")
+def home_tads_page(
+    q: str = Query(default="", max_length=200),
+    month: str = Query(default="", max_length=7),
+    status: str = Query(default="", max_length=20),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=2147483647),
+    user=Depends(browsing_user), db=Depends(get_db),
+):
+    try:
+        result = list_target_action_dates(db, q=q, month=month, status=status, limit=limit, offset=offset)
+        result["items"] = [public_record(item) for item in result["items"]]
+        return result
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     except SQLAlchemyError:
         raise HTTPException(503, "Target action dates are temporarily unavailable.") from None
 
@@ -202,36 +238,65 @@ def home_filings(
 
 @app.get("/api/studies")
 def studies(
-    q: str = "",
+    response: Response,
+    q: str = Query(default="", max_length=200),
     company_id: int | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=2147483647),
     user=Depends(browsing_user),
     db=Depends(get_db),
 ):
-    query = select(Study).order_by(Study.last_checked.desc(), Study.id)
+    query = select(Study, Company).join(Company, Company.id == Study.company_id).order_by(Study.last_checked.desc(), Study.id)
     if company_id:
         query = query.where(Study.company_id == company_id)
-    rows = db.scalars(query).all()
-    q = q.strip().casefold()
+    q = q.strip().lower()
     if q:
-        rows = [
-            s
-            for s in rows
-            if q
-            in (" ".join([s.id, s.title, s.drug, s.conditions, s.targets])).casefold()
-        ]
-    companies = {c.id: c for c in db.scalars(select(Company))}
+        query = query.where(or_(*[
+            func.lower(func.coalesce(column, "")).contains(q, autoescape=True)
+            for column in (Study.id, Study.title, Study.drug, Study.conditions, Study.targets,
+                           Study.phase, Study.status, Company.name, Company.ticker)
+        ]))
+    response.headers["X-Total-Count"] = str(db.scalar(select(func.count()).select_from(query.order_by(None).subquery())))
+    rows = db.execute(query.limit(limit).offset(offset)).all()
     return [
         {
             **as_dict(s),
             "conditions": json.loads(s.conditions),
             "targets": json.loads(s.targets),
-            "ticker": companies[s.company_id].ticker,
-            "company": companies[s.company_id].name,
-            "coverage_status": companies[s.company_id].coverage_status,
-            "coverage_label": _coverage_label(companies[s.company_id].coverage_status),
+            "ticker": company.ticker,
+            "company": company.name,
+            "coverage_status": company.coverage_status,
+            "coverage_label": _coverage_label(company.coverage_status),
         }
-        for s in rows
+        for s, company in rows
     ]
+
+
+@app.get("/api/themes")
+def themes(
+    kind: Literal["drug", "target", "indication"],
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=50, ge=1, le=100),
+    user=Depends(browsing_user), db=Depends(get_db),
+):
+    column = {"drug": Study.drug, "target": Study.targets, "indication": Study.conditions}[kind]
+    search = q.strip().casefold()
+    if db.get_bind().dialect.name == "sqlite":
+        values = func.json_each(func.td_terms(column, "split" if kind == "drug" else "json")).table_valued("value").alias("terms")
+        term = func.trim(values.c.value)
+        query = select(func.min(term)).select_from(Study).join(values, true()).where(term != "")
+        if search:
+            query = query.where(func.lower(term).contains(search, autoescape=True))
+        return db.scalars(query.group_by(func.lower(term)).order_by(func.lower(term)).limit(limit)).all()
+    # Preserve the existing workstation database path without fetching Study objects.
+    unique = {}
+    for raw in db.scalars(select(column).execution_options(yield_per=500)):
+        values = (raw or "").split(";") if kind == "drug" else json.loads(raw or "[]")
+        for value in values:
+            value = value.strip()
+            if value and (not search or search in value.casefold()):
+                unique.setdefault(value.casefold(), value)
+    return [unique[key] for key in sorted(unique)[:limit]]
 
 
 @app.get("/api/studies/{study_id}")
@@ -240,11 +305,12 @@ def study_detail(study_id: str, user=Depends(browsing_user), db=Depends(get_db))
     if not row:
         raise HTTPException(404, "Trial not found")
     company = db.get(Company, row.company_id)
-    snapshots = db.scalars(
-        select(Snapshot)
+    snapshots = db.execute(
+        select(Snapshot.id, Snapshot.study_id, Snapshot.captured_at,
+               Snapshot.source_updated, Snapshot.digest)
         .where(Snapshot.study_id == study_id)
         .order_by(Snapshot.id.desc())
-    ).all()
+    ).mappings().all()
     evidence = db.scalars(
         select(Evidence)
         .where(Evidence.study_id == study_id, Evidence.review_status == "approved")
@@ -258,13 +324,10 @@ def study_detail(study_id: str, user=Depends(browsing_user), db=Depends(get_db))
             "coverage_label": _coverage_label(company.coverage_status),
         },
         "reconciliation": reconciliation(db, study_id),
-        "snapshots": [
-            {k: v for k, v in as_dict(s).items() if k not in ("raw_json", "normalized")}
-            for s in snapshots
-        ],
-        "guidance": [as_dict(e) for e in evidence],
+        "snapshots": [dict(s) for s in snapshots],
+        "guidance": [public_record(as_dict(e)) for e in evidence],
         "changes": [
-            c for c in published_changes(db, user.id if user else None) if c["study_id"] == study_id
+            public_record(c) for c in published_changes(db, user.id if user else None, study_id=study_id)
         ],
     }
 
@@ -292,9 +355,12 @@ def targets(study_id: str, body: TargetBody, user=Depends(admin), db=Depends(get
 
 @app.get("/api/changes")
 def changes(
+    response: Response,
     followed: bool | None = None,
     category: str = "",
-    q: str = "",
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=2147483647),
     user=Depends(browsing_user),
     db=Depends(get_db),
 ):
@@ -302,12 +368,11 @@ def changes(
     if followed is None:
         followed = user is not None
     if followed and user is None:
+        response.headers["X-Total-Count"] = "0"
         return []
-    rows = published_changes(db, user.id if user else None, followed)
-    if category:
-        rows = [r for r in rows if r["category"] == category]
-    if q:
-        rows = [r for r in rows if q.casefold() in json.dumps(r).casefold()]
+    rows, total = published_changes_page(db, user.id if user else None, followed=followed,
+                                         category=category, q=q, limit=limit, offset=offset)
+    response.headers["X-Total-Count"] = str(total)
     return rows
 
 
@@ -333,7 +398,7 @@ def change_detail(change_id: int, user=Depends(browsing_user), db=Depends(get_db
                 continue
             if isinstance(e, Evidence) and e.review_status != "approved" and (not user or not user.is_admin):
                 continue
-            item = as_dict(e)
+            item = public_record(as_dict(e))
             item.pop("raw_json", None)
             if isinstance(e, Snapshot):
                 item.update(
@@ -345,7 +410,7 @@ def change_detail(change_id: int, user=Depends(browsing_user), db=Depends(get_db
             item["label"] = label
             evidence.append(item)
     return {
-        **change_dict(db, row),
+        **public_record(change_dict(db, row)),
         "evidence": evidence,
         "reconciliation": reconciliation(db, row.study_id),
     }
